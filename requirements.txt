@@ -1,0 +1,14 @@
+# Step 1 of the install (see install.sh / README.md).
+# transformers==4.57.1 is intentionally NOT here: it pins huggingface-hub<1.0,
+# which pip cannot reconcile with gradio 6's huggingface-hub>=1.16 in a single
+# resolve. It is installed as a second step — same trick the HF Space uses.
+torch==2.10.0
+torchvision==0.25.0
+gradio>=6.0,<7
+matplotlib>=3.7.0
+einops>=0.8.0
+addict>=2.4.0
+easydict>=1.13
+pymupdf>=1.27.0
+psutil>=5.9.0
+Pillow>=10.0.0
