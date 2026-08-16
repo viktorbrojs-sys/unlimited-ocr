@@ -12,3 +12,5 @@ easydict>=1.13
 pymupdf>=1.27.0
 psutil>=5.9.0
 Pillow>=10.0.0
+# Optional — automatic quantized fallback for GPUs with <12 GB VRAM:
+# bitsandbytes>=0.45

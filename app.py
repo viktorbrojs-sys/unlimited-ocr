@@ -11,6 +11,7 @@ Differences from the Space version:
 Run:  python app.py   →  http://127.0.0.1:7860
 """
 
+import gc
 import os
 import sys
 import queue
@@ -18,6 +19,9 @@ import tempfile
 import threading
 from threading import Thread
 from typing import Iterator
+
+# Reduce CUDA memory fragmentation; must be set before the first CUDA allocation.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -41,22 +45,49 @@ def load_model() -> None:
     if model is not None:
         return
 
-    if torch.cuda.is_available():
-        device, dtype = "cuda", torch.bfloat16
-    else:
-        device, dtype = "cpu", torch.float32
-        print("WARNING: CUDA not available — running on CPU (this will be slow).")
-
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    print("Loading model...")
-    model = AutoModel.from_pretrained(
-        MODEL_NAME,
-        trust_remote_code=True,
-        use_safetensors=True,
-        torch_dtype=dtype,
-    ).eval().to(device)
-    print(f"Model ready on {device} ({dtype}).")
+
+    # Load attempts, most preferable first. Small-VRAM GPUs (<12 GB) OOM on the
+    # full bf16 weights (~6.7 GB + context + activations), so fall back to
+    # bitsandbytes quantization and, as a last resort, to slow CPU float32.
+    forced_cpu = os.environ.get("UNLIMITED_OCR_DEVICE", "").lower() == "cpu"
+    attempts: list[tuple[str, dict, str | None]] = []  # (label, from_pretrained kwargs, .to() target)
+    if forced_cpu:
+        attempts.append(("CPU float32", dict(torch_dtype=torch.float32), "cpu"))
+    elif torch.cuda.is_available():
+        attempts.append(("CUDA bf16", dict(torch_dtype=torch.bfloat16), "cuda"))
+        attempts.append(("CUDA 8-bit quantized (bitsandbytes)", dict(load_in_8bit=True, device_map={"": 0}), None))
+        attempts.append(("CUDA 4-bit quantized (bitsandbytes)", dict(load_in_4bit=True, device_map={"": 0}), None))
+        attempts.append(("CPU float32", dict(torch_dtype=torch.float32), "cpu"))
+    else:
+        print("WARNING: CUDA not available — running on CPU (this will be slow).")
+        attempts.append(("CPU float32", dict(torch_dtype=torch.float32), "cpu"))
+
+    last_err: Exception | None = None
+    for name, kwargs, move_to in attempts:
+        if "CPU" in name and torch.cuda.is_available():
+            print("WARNING: falling back to CPU — inference will be very slow.")
+        try:
+            print(f"Loading model: {name}...")
+            m = AutoModel.from_pretrained(
+                MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
+            )
+            m = m.eval().to(move_to) if move_to else m.eval()
+            model = m
+            print(f"Model ready: {name}")
+            return
+        except Exception as e:
+            last_err = e
+            print(f"  {name} failed: {e}")
+            if "bitsandbytes" in str(e):
+                print("  hint: .venv/bin/pip install bitsandbytes")
+            model = None
+            m = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    raise RuntimeError(f"Could not load the model with any method: {last_err}")
 
 
 app = Server()

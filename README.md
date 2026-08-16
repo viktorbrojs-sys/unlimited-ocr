@@ -58,7 +58,11 @@ parsing» — полное распознавание длинных докум�
 
 ## Возможные проблемы
 
-- **CUDA driver version is insufficient** — драйвер старее CUDA-сборки torch.
+- **CUDA out of memory при загрузке** (карты на 8 ГБ): bf16-веса (~6.7 ГБ)
+  не помещаются вместе с CUDA-контекстом и активациями. `app.py` сам пытается
+  по цепочке: bf16 → 8-бит → 4-бит → CPU. Для квантованных режимов один раз
+  установите `.venv/bin/pip install bitsandbytes` (8-бит почти не теряет
+  качество OCR). Принудительный CPU: `UNLIMITED_OCR_DEVICE=cpu .venv/bin/python app.py`.- **CUDA driver version is insufficient** — драйвер старее CUDA-сборки torch.
   Поставьте свежий драйвер либо нужную сборку torch с
   <https://download.pytorch.org> (например `--index-url https://download.pytorch.org/whl/cu126`).
 - **pip ругается на huggingface-hub при установке transformers** — ожидаемо, см. выше.
