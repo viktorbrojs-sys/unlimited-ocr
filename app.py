@@ -42,6 +42,8 @@ model = None
 _model_label: str | None = None
 _infer_lock = threading.Lock()
 
+app = Server()
+
 # UI variant selector → model-loading recipe. "auto" tries everything in order.
 _MODEL_VARIANTS: dict[str, str] = {
     "bf16": "CUDA bf16",
@@ -167,9 +169,6 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
 @app.api()
 def model_status() -> dict:
     return {"loaded": model is not None, "label": _model_label}
-
-
-app = Server()
 
 
 # ── PDF helper — CPU only ─────────────────────────────────────────────────────
