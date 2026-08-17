@@ -45,29 +45,37 @@ def load_model() -> None:
     if model is not None:
         return
 
+    # Forced-CPU mode: the model's own infer() code sends inputs to cuda
+    # whenever torch.cuda.is_available(), so a CPU-resident model next to a
+    # visible GPU crashes. Restart the process with CUDA hidden before
+    # anything initialises it.
+    if (
+        os.environ.get("UNLIMITED_OCR_DEVICE", "").lower() == "cpu"
+        and torch.cuda.is_available()
+        and os.environ.get("_UNLIMITED_OCR_CPU_REEXEC") != "1"
+    ):
+        print("UNLIMITED_OCR_DEVICE=cpu: restarting with CUDA hidden for consistent CPU mode...")
+        env = {**os.environ, "_UNLIMITED_OCR_CPU_REEXEC": "1", "CUDA_VISIBLE_DEVICES": ""}
+        os.execve(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]], env)
+
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
     # Load attempts, most preferable first. Small-VRAM GPUs (<12 GB) OOM on the
     # full bf16 weights (~6.7 GB + context + activations), so fall back to
-    # bitsandbytes quantization and, as a last resort, to slow CPU float32.
-    forced_cpu = os.environ.get("UNLIMITED_OCR_DEVICE", "").lower() == "cpu"
-    attempts: list[tuple[str, dict, str | None]] = []  # (label, from_pretrained kwargs, .to() target)
-    if forced_cpu:
-        attempts.append(("CPU float32", dict(torch_dtype=torch.float32), "cpu"))
-    elif torch.cuda.is_available():
-        attempts.append(("CUDA bf16", dict(torch_dtype=torch.bfloat16), "cuda"))
-        attempts.append(("CUDA 8-bit quantized (bitsandbytes)", dict(load_in_8bit=True, device_map={"": 0}), None))
-        attempts.append(("CUDA 4-bit quantized (bitsandbytes)", dict(load_in_4bit=True, device_map={"": 0}), None))
-        attempts.append(("CPU float32", dict(torch_dtype=torch.float32), "cpu"))
+    # bitsandbytes quantization. No CPU attempt while CUDA is visible — see above.
+    if torch.cuda.is_available():
+        attempts: list[tuple[str, dict, str | None]] = [  # (label, from_pretrained kwargs, .to() target)
+            ("CUDA bf16", dict(torch_dtype=torch.bfloat16), "cuda"),
+            ("CUDA 8-bit quantized (bitsandbytes)", dict(load_in_8bit=True, device_map={"": 0}), None),
+            ("CUDA 4-bit quantized (bitsandbytes)", dict(load_in_4bit=True, device_map={"": 0}), None),
+        ]
     else:
-        print("WARNING: CUDA not available — running on CPU (this will be slow).")
-        attempts.append(("CPU float32", dict(torch_dtype=torch.float32), "cpu"))
+        print("WARNING: CUDA not available — running on CPU (this will be very slow).")
+        attempts = [("CPU float32", dict(torch_dtype=torch.float32), "cpu")]
 
     last_err: Exception | None = None
     for name, kwargs, move_to in attempts:
-        if "CPU" in name and torch.cuda.is_available():
-            print("WARNING: falling back to CPU — inference will be very slow.")
         try:
             print(f"Loading model: {name}...")
             m = AutoModel.from_pretrained(
@@ -80,14 +88,20 @@ def load_model() -> None:
         except Exception as e:
             last_err = e
             print(f"  {name} failed: {e}")
-            if "bitsandbytes" in str(e):
-                print("  hint: .venv/bin/pip install bitsandbytes")
+            for dep in ("bitsandbytes", "accelerate"):
+                if dep in str(e):
+                    print(f"  hint: .venv/bin/pip install {dep}")
             model = None
             m = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    raise RuntimeError(f"Could not load the model with any method: {last_err}")
+    raise RuntimeError(
+        "Could not load the model on the GPU. Install the quantization deps "
+        "('.venv/bin/pip install bitsandbytes accelerate') and try again. To force "
+        "slow CPU mode: UNLIMITED_OCR_DEVICE=cpu .venv/bin/python app.py "
+        f"(last error: {last_err})"
+    )
 
 
 app = Server()

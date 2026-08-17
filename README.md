@@ -60,9 +60,14 @@ parsing» — полное распознавание длинных докум�
 
 - **CUDA out of memory при загрузке** (карты на 8 ГБ): bf16-веса (~6.7 ГБ)
   не помещаются вместе с CUDA-контекстом и активациями. `app.py` сам пытается
-  по цепочке: bf16 → 8-бит → 4-бит → CPU. Для квантованных режимов один раз
-  установите `.venv/bin/pip install bitsandbytes` (8-бит почти не теряет
-  качество OCR). Принудительный CPU: `UNLIMITED_OCR_DEVICE=cpu .venv/bin/python app.py`.- **CUDA driver version is insufficient** — драйвер старее CUDA-сборки torch.
+  по цепочке: bf16 → 8-бит → 4-бит. Для квантованных режимов один раз
+  установите `.venv/bin/pip install bitsandbytes accelerate` (8-бит почти не
+  теряет качество OCR). Принудительный CPU (медленно):
+  `UNLIMITED_OCR_DEVICE=cpu .venv/bin/python app.py` — процесс сам перезапустится
+  со скрытой CUDA, иначе код модели отправит входные тензоры на GPU.
+- **«Expected all tensors to be on the same device»** — модель загрузилась в
+  CPU при видимом CUDA из-за старой версии app.py: обновитесь (`git pull`) и
+  установите `bitsandbytes accelerate`, как выше.- **CUDA driver version is insufficient** — драйвер старее CUDA-сборки torch.
   Поставьте свежий драйвер либо нужную сборку torch с
   <https://download.pytorch.org> (например `--index-url https://download.pytorch.org/whl/cu126`).
 - **pip ругается на huggingface-hub при установке transformers** — ожидаемо, см. выше.

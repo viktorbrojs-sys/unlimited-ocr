@@ -12,6 +12,8 @@ python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install "transformers==4.57.1"
+# Quantized fallback deps for GPUs with <12 GB VRAM (device_map + 8/4-bit):
+.venv/bin/pip install bitsandbytes accelerate
 
 echo
 echo "Done. Start the server with:"
