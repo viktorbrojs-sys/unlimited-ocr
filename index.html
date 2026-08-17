@@ -87,6 +87,12 @@
 
     .ngram-group { display: flex; align-items: center; gap: 8px; }
     .ngram-label { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); letter-spacing: 0.06em; }
+    .model-select {
+      background: var(--bg-surface); color: var(--text-primary);
+      font-family: var(--font-mono); font-size: 10px;
+      border: 1px solid var(--border); border-radius: 5px;
+      padding: 3px 6px; cursor: pointer; outline: none;
+    }
     .toggle-wrap { position: relative; width: 36px; height: 20px; }
     .toggle-wrap input { display: none; }
     .toggle-track { position: absolute; inset: 0; background: var(--border); border-radius: 10px; cursor: pointer; transition: background 0.2s; }
@@ -238,8 +244,8 @@
     <div class="header-sep"></div>
 
     <div class="mode-group" role="group" aria-label="Inference mode">
-      <button class="mode-btn active" id="btn-long" onclick="setMode('long')">Long</button>
-      <button class="mode-btn"        id="btn-base" onclick="setMode('base')">Base</button>
+      <button class="mode-btn active" id="btn-long" onclick="setMode('long')">Long · 640px</button>
+      <button class="mode-btn"        id="btn-base" onclick="setMode('base')">Base · 1024px</button>
     </div>
     <div class="header-sep"></div>
     <div class="ngram-group">
@@ -248,6 +254,19 @@
         <input type="checkbox" id="ngram-toggle" checked />
         <div class="toggle-track"></div>
       </label>
+    </div>
+
+    <div class="header-sep"></div>
+
+    <div class="ngram-group">
+      <span class="ngram-label">MODEL</span>
+      <select id="model-select" class="model-select">
+        <option value="auto" selected>auto</option>
+        <option value="bf16">bf16 · ~7 GB</option>
+        <option value="8bit">8-bit · ~6 GB</option>
+        <option value="4bit">4-bit · ~3.5 GB</option>
+      </select>
+      <button class="btn" id="load-btn" onclick="loadModel()">LOAD</button>
     </div>
 
     <div class="header-actions">
@@ -376,17 +395,52 @@ let isRunning     = false;
 let stopRequested = false;
 let charCount     = 0;
 let zoomedOut     = false;
+let modelReady    = false;
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
   try {
     client = await Client.connect(window.location.origin);
-    setStatus('idle', 'READY · model loaded');
+    const res  = await client.predict('/model_status', {});
+    const st   = res?.data?.[0] ?? {};
+    if (st.loaded) {
+      modelReady = true;
+      setStatus('idle', 'READY · ' + (st.label ?? 'model'));
+    } else {
+      setStatus('idle', 'MODEL NOT LOADED · pick a variant and press LOAD');
+    }
   } catch (e) {
     setStatus('error', 'CONNECTION ERROR · ' + e.message);
   }
 }
 boot();
+
+// ── Model loading (variant picker in the header) ─────────────────────────────
+async function loadModel() {
+  if (!client) { showToast('Client not ready yet'); return; }
+  const btn     = document.getElementById('load-btn');
+  const variant = document.getElementById('model-select').value;
+  btn.disabled  = true;
+  modelReady    = false;
+  setStatus('running', 'LOADING MODEL · ' + variant.toUpperCase());
+  try {
+    const sub = client.submit('/load_model', { variant });
+    for await (const msg of sub) {
+      if (msg.type === 'data') {
+        const d = msg.data?.[0] ?? {};
+        if (d.stage) setStatus(d.ready ? 'idle' : 'running', d.stage.toUpperCase());
+        if (d.ready) { modelReady = true; showToast('Model loaded'); }
+      }
+      if (msg.type === 'status' && msg.stage === 'complete') break;
+    }
+    if (!modelReady) setStatus('error', 'MODEL NOT LOADED · load failed, see stage above');
+  } catch (e) {
+    setStatus('error', 'LOAD ERROR · ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+window.loadModel = loadModel;
 
 // ── Global handlers (called from onclick="…") ─────────────────────────────────
 window.setMode = (m) => {
@@ -475,6 +529,7 @@ async function loadFile(file) {
 async function startOCR() {
   if (!currentFile || isRunning) return;
   if (!client) { showToast('Client not ready yet'); return; }
+  if (!modelReady) { showToast('Model not loaded — pick a variant and press LOAD'); return; }
 
   isRunning     = true;
   stopRequested = false;

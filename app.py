@@ -4,11 +4,13 @@ Unlimited-OCR — local inference server (port of the HF Space baidu/Unlimited-O
 Differences from the Space version:
   • No ZeroGPU: the @spaces.GPU decorator is gone, pages can run as long as needed.
   • No runtime `pip install` of pinned deps — install requirements.txt into a venv.
-  • Falls back to CPU (float32) when CUDA is unavailable (slow, but works).
+  • The server starts instantly; the model loads on demand from the web UI
+    (variant selector in the header: auto / bf16 / 8-bit / 4-bit), with automatic
+    fallback to quantized variants on small-VRAM GPUs.
   • A lock serializes model.infer() calls: one GPU, one inference at a time,
     and the stdout-interception streaming assumes a single inference in flight.
 
-Run:  python app.py   →  http://127.0.0.1:7860
+Run:  python app.py   →  http://127.0.0.1:7860 (busy ports auto-increment)
 """
 
 import gc
@@ -37,71 +39,134 @@ MODEL_NAME = "baidu/Unlimited-OCR"
 
 tokenizer = None
 model = None
+_model_label: str | None = None
 _infer_lock = threading.Lock()
 
+# UI variant selector → model-loading recipe. "auto" tries everything in order.
+_MODEL_VARIANTS: dict[str, str] = {
+    "bf16": "CUDA bf16",
+    "8bit": "CUDA 8-bit quantized (bitsandbytes)",
+    "4bit": "CUDA 4-bit quantized (bitsandbytes)",
+}
 
-def load_model() -> None:
-    global tokenizer, model
+
+def _variant_kwargs(name: str) -> tuple[dict, str | None]:
+    """from_pretrained kwargs and .to() target for a variant label."""
+    if name == "CUDA bf16":
+        return dict(torch_dtype=torch.bfloat16), "cuda"
+    if name == "CUDA 8-bit quantized (bitsandbytes)":
+        return dict(load_in_8bit=True, device_map={"": 0}), None
+    if name == "CUDA 4-bit quantized (bitsandbytes)":
+        return dict(load_in_4bit=True, device_map={"": 0}), None
+    return dict(torch_dtype=torch.float32), "cpu"  # CPU float32
+
+
+def _load_model_sync(variant: str, q) -> None:
+    """Load the requested variant; push ("stage"|"done"|"error", text) into q.
+
+    Small-VRAM GPUs (<12 GB) OOM on the full bf16 weights (~6.7 GB + context +
+    activations), hence the bitsandbytes fallbacks. No CPU attempt while CUDA
+    is visible — the model's own infer() code sends inputs to cuda whenever
+    torch.cuda.is_available() and would crash against a CPU-resident model.
+    """
+    global tokenizer, model, _model_label
     if model is not None:
-        return
+        q.put(("stage", "Unloading current model..."))
+        model = None
+        _model_label = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # Forced-CPU mode: the model's own infer() code sends inputs to cuda
-    # whenever torch.cuda.is_available(), so a CPU-resident model next to a
-    # visible GPU crashes. Restart the process with CUDA hidden before
-    # anything initialises it.
-    if (
-        os.environ.get("UNLIMITED_OCR_DEVICE", "").lower() == "cpu"
-        and torch.cuda.is_available()
-        and os.environ.get("_UNLIMITED_OCR_CPU_REEXEC") != "1"
-    ):
-        print("UNLIMITED_OCR_DEVICE=cpu: restarting with CUDA hidden for consistent CPU mode...")
-        env = {**os.environ, "_UNLIMITED_OCR_CPU_REEXEC": "1", "CUDA_VISIBLE_DEVICES": ""}
-        os.execve(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]], env)
+    if tokenizer is None:
+        q.put(("stage", "Loading tokenizer..."))
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
-    print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-
-    # Load attempts, most preferable first. Small-VRAM GPUs (<12 GB) OOM on the
-    # full bf16 weights (~6.7 GB + context + activations), so fall back to
-    # bitsandbytes quantization. No CPU attempt while CUDA is visible — see above.
-    if torch.cuda.is_available():
-        attempts: list[tuple[str, dict, str | None]] = [  # (label, from_pretrained kwargs, .to() target)
-            ("CUDA bf16", dict(torch_dtype=torch.bfloat16), "cuda"),
-            ("CUDA 8-bit quantized (bitsandbytes)", dict(load_in_8bit=True, device_map={"": 0}), None),
-            ("CUDA 4-bit quantized (bitsandbytes)", dict(load_in_4bit=True, device_map={"": 0}), None),
-        ]
+    if not torch.cuda.is_available():
+        names = ["CPU float32"]
+    elif variant == "auto":
+        names = [_MODEL_VARIANTS["bf16"], _MODEL_VARIANTS["8bit"], _MODEL_VARIANTS["4bit"]]
     else:
-        print("WARNING: CUDA not available — running on CPU (this will be very slow).")
-        attempts = [("CPU float32", dict(torch_dtype=torch.float32), "cpu")]
+        names = [_MODEL_VARIANTS[variant]]
 
     last_err: Exception | None = None
-    for name, kwargs, move_to in attempts:
+    for name in names:
+        if name == "CPU float32":
+            q.put(("stage", "WARNING: CUDA not available — CPU mode will be slow."))
         try:
-            print(f"Loading model: {name}...")
+            q.put(("stage", f"Loading model: {name}..."))
+            kwargs, move_to = _variant_kwargs(name)
             m = AutoModel.from_pretrained(
                 MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
             )
             m = m.eval().to(move_to) if move_to else m.eval()
             model = m
-            print(f"Model ready: {name}")
+            _model_label = name
+            q.put(("done", name))
             return
         except Exception as e:
             last_err = e
-            print(f"  {name} failed: {e}")
+            q.put(("stage", f"{name} failed: {e}"))
             for dep in ("bitsandbytes", "accelerate"):
                 if dep in str(e):
-                    print(f"  hint: .venv/bin/pip install {dep}")
+                    q.put(("stage", f"hint: .venv/bin/pip install {dep}"))
             model = None
             m = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     raise RuntimeError(
-        "Could not load the model on the GPU. Install the quantization deps "
-        "('.venv/bin/pip install bitsandbytes accelerate') and try again. To force "
-        "slow CPU mode: UNLIMITED_OCR_DEVICE=cpu .venv/bin/python app.py "
-        f"(last error: {last_err})"
+        "Could not load the model. Install the quantization deps "
+        "('.venv/bin/pip install bitsandbytes accelerate') and try again, or pick "
+        f"a smaller variant. Last error: {last_err}"
     )
+
+
+@app.api(stream_every=0.5)
+def load_model(variant: str = "auto") -> Iterator[dict]:
+    """
+    Load (or switch) the model on demand. Streams progress dicts:
+    {"stage": str, "ready": bool, "label": str | None}
+    """
+    if variant != "auto" and variant not in _MODEL_VARIANTS:
+        yield {"stage": f"Unknown variant: {variant}", "ready": False, "label": None}
+        return
+    if not _infer_lock.acquire(blocking=False):
+        yield {"stage": "OCR in progress — try again after it finishes", "ready": False, "label": None}
+        return
+
+    q: queue.Queue = queue.Queue()
+
+    def _worker():
+        try:
+            _load_model_sync(variant, q)
+        except Exception as e:
+            q.put(("error", str(e)))
+        finally:
+            q.put(None)
+
+    Thread(target=_worker, daemon=True).start()
+    try:
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            kind, msg = item
+            if kind == "stage":
+                yield {"stage": msg, "ready": False, "label": None}
+            elif kind == "done":
+                yield {"stage": f"Model ready: {msg}", "ready": True, "label": msg}
+                return
+            elif kind == "error":
+                yield {"stage": f"FAILED: {msg}", "ready": False, "label": None}
+                return
+    finally:
+        _infer_lock.release()
+
+
+@app.api()
+def model_status() -> dict:
+    return {"loaded": model is not None, "label": _model_label}
 
 
 app = Server()
@@ -188,7 +253,7 @@ def run_ocr(
           'base'   — accurate (1024 px)
     """
     if model is None:
-        yield {"text": "Model is not loaded yet — wait for startup to finish.", "done": True}
+        yield {"text": "Model is not loaded — pick a variant and press LOAD in the header.", "done": True}
         return
 
     path    = image_path["path"]
@@ -285,9 +350,28 @@ async def homepage():
 
 
 if __name__ == "__main__":
-    load_model()
-    app.launch(
-        server_name=os.environ.get("HOST", "127.0.0.1"),
-        server_port=int(os.environ.get("PORT", "7860")),
-        show_error=True,
-    )
+    # Forced-CPU mode: the model's own infer() code sends inputs to cuda
+    # whenever torch.cuda.is_available(), so a CPU-resident model next to a
+    # visible GPU crashes. Restart with CUDA hidden before anything initialises it.
+    if (
+        os.environ.get("UNLIMITED_OCR_DEVICE", "").lower() == "cpu"
+        and torch.cuda.is_available()
+        and os.environ.get("_UNLIMITED_OCR_CPU_REEXEC") != "1"
+    ):
+        print("UNLIMITED_OCR_DEVICE=cpu: restarting with CUDA hidden for consistent CPU mode...")
+        env = {**os.environ, "_UNLIMITED_OCR_CPU_REEXEC": "1", "CUDA_VISIBLE_DEVICES": ""}
+        os.execve(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]], env)
+
+    # The server starts immediately (no model); pick a variant in the web UI.
+    port = int(os.environ.get("PORT", "7860"))
+    while True:
+        try:
+            app.launch(
+                server_name=os.environ.get("HOST", "127.0.0.1"),
+                server_port=port,
+                show_error=True,
+            )
+            break
+        except OSError:
+            print(f"Port {port} is busy — trying {port + 1}...")
+            port += 1
