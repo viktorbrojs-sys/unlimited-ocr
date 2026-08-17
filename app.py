@@ -13,6 +13,7 @@ Differences from the Space version:
 Run:  python app.py   →  http://127.0.0.1:7860 (busy ports auto-increment)
 """
 
+import atexit
 import gc
 import os
 import sys
@@ -41,6 +42,25 @@ tokenizer = None
 model = None
 _model_label: str | None = None
 _infer_lock = threading.Lock()
+_temp_dirs: list[str] = []
+
+
+def _cleanup() -> None:
+    """Release model weights and remove temp directories on process exit."""
+    global model, tokenizer
+    model = None
+    tokenizer = None
+    gc.collect()
+    import shutil
+    for d in _temp_dirs:
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+    _temp_dirs.clear()
+
+
+atexit.register(_cleanup)
 
 app = Server()
 
@@ -56,8 +76,8 @@ _MODEL_VARIANTS: dict[str, str] = {
 def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
     if name == "CUDA bf16":
-        return dict(torch_dtype=torch.bfloat16), "cuda"
-    return dict(torch_dtype=torch.float32), "cpu"
+        return dict(dtype=torch.bfloat16), "cuda"
+    return dict(dtype=torch.float32), "cpu"
 
 
 def _load_model_sync(variant: str, q) -> None:
@@ -121,6 +141,15 @@ def _load_model_sync(variant: str, q) -> None:
     )
 
 
+def _target_labels(variant: str) -> list[str]:
+    """Resolve variant name to the list of model labels it would try."""
+    if not torch.cuda.is_available():
+        return ["CPU float32"]
+    if variant == "auto":
+        return ["CUDA bf16", "CPU float32 (restart)"]
+    return [_MODEL_VARIANTS.get(variant, variant)]
+
+
 @app.api(stream_every=0.5)
 def load_model(variant: str = "auto") -> Iterator[dict]:
     """
@@ -133,6 +162,12 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
     if variant != "auto" and variant not in _MODEL_VARIANTS:
         yield {"stage": f"Unknown variant: {variant}", "ready": False, "label": None}
         return
+
+    # Skip reload if the model is already loaded with the requested variant.
+    if _model_label in _target_labels(variant):
+        yield {"stage": f"Model already loaded: {_model_label}", "ready": True, "label": _model_label}
+        return
+
     if not _infer_lock.acquire(blocking=False):
         yield {"stage": "OCR in progress — try again after it finishes", "ready": False, "label": None}
         return
@@ -150,7 +185,12 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
     Thread(target=_worker, daemon=True).start()
     try:
         while True:
-            item = q.get()
+            try:
+                item = q.get(timeout=15)
+            except queue.Empty:
+                # Keep-alive: prevent SSE timeout during long from_pretrained().
+                yield {"stage": "Still loading model… (download may take a while)", "ready": False, "label": None}
+                continue
             if item is None:
                 break
             kind, msg = item
@@ -161,8 +201,6 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
                 return
             elif kind == "cpu_restart":
                 yield {"stage": "Restarting server in CPU mode...", "ready": False, "label": None}
-                # Re-exec self with CUDA hidden. The new process will serve on the same port
-                # (old one will die with the lock released).
                 import time
                 time.sleep(1)
                 env = {**os.environ, "UNLIMITED_OCR_CPU_REEXEC": "1", "CUDA_VISIBLE_DEVICES": ""}
@@ -185,6 +223,7 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
     import fitz
     doc = fitz.open(pdf_path)
     tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
+    _temp_dirs.append(tmp_dir)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     paths = []
     for i, page in enumerate(doc):
@@ -265,6 +304,7 @@ def run_ocr(
 
     path    = image_path["path"]
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
+    _temp_dirs.append(out_dir)
 
     if mode == "gundam":
         base_size, image_size, crop_mode, ngram_window = 1024, 640,  True,  128

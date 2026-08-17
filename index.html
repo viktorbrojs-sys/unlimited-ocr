@@ -411,16 +411,35 @@ async function boot() {
   } catch (e) {
     setStatus('error', 'CONNECTION ERROR · ' + e.message);
   }
+  syncUI();
 }
 boot();
 
 // ── Model loading (variant picker in the header) ─────────────────────────────
+function syncUI() {
+  document.getElementById('start-btn').disabled = !(currentFile && modelReady);
+}
+
+async function _pollModelStatus() {
+  try {
+    const res = await client.predict('/model_status', {});
+    const st  = res?.data?.[0] ?? {};
+    if (st.loaded && !modelReady) {
+      modelReady = true;
+      setStatus('idle', 'READY · ' + (st.label ?? 'model'));
+      showToast('Model loaded');
+      syncUI();
+    }
+  } catch (_) { /* ignore polling errors */ }
+}
+
 async function loadModel() {
   if (!client) { showToast('Client not ready yet'); return; }
   const btn     = document.getElementById('load-btn');
   const variant = document.getElementById('model-select').value;
   btn.disabled  = true;
   modelReady    = false;
+  syncUI();
   setStatus('running', 'LOADING MODEL · ' + variant.toUpperCase());
   try {
     const sub = client.submit('/load_model', { variant });
@@ -432,11 +451,13 @@ async function loadModel() {
       }
       if (msg.type === 'status' && msg.stage === 'complete') break;
     }
-    if (!modelReady) setStatus('error', 'MODEL NOT LOADED · load failed, see stage above');
   } catch (e) {
     setStatus('error', 'LOAD ERROR · ' + e.message);
   } finally {
     btn.disabled = false;
+    // Safety-net: if SSE dropped or format mismatched, poll actual model state.
+    if (!modelReady) await _pollModelStatus();
+    syncUI();
   }
 }
 window.loadModel = loadModel;
@@ -520,7 +541,7 @@ async function loadFile(file) {
   }
 
   setStatus('idle', `READY · ${file.name}`);
-  document.getElementById('start-btn').disabled = false;
+  syncUI();
   clearOutput();
 }
 
@@ -728,11 +749,11 @@ function clearAll() {
   v.classList.remove('visible'); v.innerHTML = '';
   document.getElementById('zoom-btn').style.display       = 'none';
   document.getElementById('input-type-tag').textContent   = 'EMPTY';
-  document.getElementById('start-btn').disabled           = true;
   document.getElementById('page-info').style.display      = 'none';
   document.getElementById('file-input').value             = '';
   clearOutput();
   setStatus('idle', 'IDLE · drop or click to load a document');
+  syncUI();
 }
 
 function copyText() {
