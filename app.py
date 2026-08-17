@@ -81,7 +81,8 @@ def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
     if name == "CUDA bf16":
         return dict(dtype=torch.bfloat16), "cuda"
-    return dict(dtype=torch.float32), "cpu"
+    # For CPU mode, explicitly ensure no CUDA device is used
+    return dict(dtype=torch.float32, device_map="cpu"), "cpu"
 
 
 def _load_model_sync(variant: str, q) -> None:
@@ -249,20 +250,40 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
 
 def _collect_output(out_dir: str) -> str:
     """Read all text/markdown files written by model.infer()."""
+    # Wait a bit for the model to finish writing files
+    import time
+    time.sleep(0.5)
+    
     result = ""
-    for fname in sorted(os.listdir(out_dir)):
+    try:
+        files = sorted(os.listdir(out_dir))
+    except Exception:
+        return ""
+    
+    for fname in files:
         if fname.endswith((".txt", ".md")):
-            with open(os.path.join(out_dir, fname), "r", encoding="utf-8") as f:
-                result += f.read() + "\n"
+            fpath = os.path.join(out_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if content:
+                        result += content + "\n"
+            except Exception:
+                pass
+    
+    # If no .txt/.md files found, try to read any file
     if not result:
-        for fname in sorted(os.listdir(out_dir)):
+        for fname in files:
             fpath = os.path.join(out_dir, fname)
             if os.path.isfile(fpath):
                 try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        result += f.read() + "\n"
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().strip()
+                        if content:
+                            result += content + "\n"
                 except Exception:
                     pass
+    
     return result.strip()
 
 
@@ -375,24 +396,20 @@ def run_ocr(
     # ── Fallback/Final: read file to get clean text ───────────────────────────
     full_text = _collect_output(out_dir)
 
-    if accumulated:
-        if full_text:
-            yield {"text": full_text, "done": True}
-        else:
-            yield {"text": accumulated, "done": True}
+    if full_text:
+        # Stream the final result word by word for better UX
+        words = full_text.split()
+        acc = ""
+        for i, word in enumerate(words):
+            acc += ("" if i == 0 else " ") + word
+            if i % 5 == 0 or i == len(words) - 1:
+                yield {"text": acc, "done": i == len(words) - 1}
+    elif accumulated:
+        yield {"text": accumulated, "done": True}
     else:
-        if full_text:
-            words = full_text.split()
-            acc = ""
-            for i, word in enumerate(words):
-                acc += ("" if i == 0 else " ") + word
-                if i % 5 == 0:
-                    yield {"text": acc, "done": False}
-            yield {"text": full_text, "done": True}
-        else:
-            if errors:
-                raise RuntimeError(f"Inference failed: {', '.join(errors)}")
-            yield {"text": "", "done": True}
+        if errors:
+            raise RuntimeError(f"Inference failed: {', '.join(errors)}")
+        yield {"text": "", "done": True}
 
 
 # ── PDF explode — CPU only ───────────────────────────────────────────────────
