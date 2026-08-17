@@ -42,22 +42,26 @@ tokenizer = None
 model = None
 _model_label: str | None = None
 _infer_lock = threading.Lock()
+_model_state_lock = threading.Lock()  # Separate lock for model state checks
 _temp_dirs: list[str] = []
+_temp_dirs_lock = threading.Lock()  # Protect _temp_dirs from concurrent access
 
 
 def _cleanup() -> None:
     """Release model weights and remove temp directories on process exit."""
     global model, tokenizer
-    model = None
-    tokenizer = None
+    with _model_state_lock:
+        model = None
+        tokenizer = None
     gc.collect()
     import shutil
-    for d in _temp_dirs:
-        try:
-            shutil.rmtree(d, ignore_errors=True)
-        except Exception:
-            pass
-    _temp_dirs.clear()
+    with _temp_dirs_lock:
+        for d in _temp_dirs[:]:  # Copy list to avoid modification during iteration
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+        _temp_dirs.clear()
 
 
 atexit.register(_cleanup)
@@ -90,17 +94,18 @@ def _load_model_sync(variant: str, q) -> None:
     caller can re-exec the whole process with CUDA_VISIBLE_DEVICES="".
     """
     global tokenizer, model, _model_label
-    if model is not None:
-        q.put(("stage", "Unloading current model..."))
-        model = None
-        _model_label = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    with _model_state_lock:
+        if model is not None:
+            q.put(("stage", "Unloading current model..."))
+            model = None
+            _model_label = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    if tokenizer is None:
-        q.put(("stage", "Loading tokenizer..."))
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        if tokenizer is None:
+            q.put(("stage", "Loading tokenizer..."))
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
     if not torch.cuda.is_available():
         names = ["CPU float32"]
@@ -123,14 +128,16 @@ def _load_model_sync(variant: str, q) -> None:
                 MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
             )
             m = m.eval().to(move_to) if move_to else m.eval()
-            model = m
-            _model_label = name
+            with _model_state_lock:
+                model = m
+                _model_label = name
             q.put(("done", name))
             return
         except Exception as e:
             last_err = e
             q.put(("stage", f"{name} failed: {e}"))
-            model = None
+            with _model_state_lock:
+                model = None
             m = None
             gc.collect()
             if torch.cuda.is_available():
@@ -164,8 +171,10 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
         return
 
     # Skip reload if the model is already loaded with the requested variant.
-    if _model_label in _target_labels(variant):
-        yield {"stage": f"Model already loaded: {_model_label}", "ready": True, "label": _model_label}
+    with _model_state_lock:
+        current_label = _model_label
+    if current_label in _target_labels(variant):
+        yield {"stage": f"Model already loaded: {current_label}", "ready": True, "label": current_label}
         return
 
     if not _infer_lock.acquire(blocking=False):
@@ -183,6 +192,7 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
             q.put(None)
 
     Thread(target=_worker, daemon=True).start()
+    lock_held = True
     try:
         while True:
             try:
@@ -209,12 +219,14 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
                 yield {"stage": f"FAILED: {msg}", "ready": False, "label": None}
                 return
     finally:
-        _infer_lock.release()
+        if lock_held:
+            _infer_lock.release()
 
 
 @app.api()
 def model_status() -> dict:
-    return {"loaded": model is not None, "label": _model_label}
+    with _model_state_lock:
+        return {"loaded": model is not None, "label": _model_label}
 
 
 # ── PDF helper — CPU only ─────────────────────────────────────────────────────
@@ -223,7 +235,8 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
     import fitz
     doc = fitz.open(pdf_path)
     tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
-    _temp_dirs.append(tmp_dir)
+    with _temp_dirs_lock:
+        _temp_dirs.append(tmp_dir)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     paths = []
     for i, page in enumerate(doc):
@@ -265,16 +278,18 @@ class ThreadTargetedStdout:
         self.target_thread = target_thread
         self.q = q
         self.original_stdout = original_stdout
+        self._lock = threading.Lock()
 
     def write(self, data):
         self.original_stdout.write(data)
         self.original_stdout.flush()
-        if threading.current_thread() == self.target_thread:
-            if data:
-                lower_data = data.lower()
-                if "tps:" in lower_data or "tokens/s" in lower_data:
-                    return len(data)
-                self.q.put(data)
+        with self._lock:
+            if threading.current_thread() is self.target_thread:
+                if data:
+                    lower_data = data.lower()
+                    if "tps:" in lower_data or "tokens/s" in lower_data:
+                        return len(data)
+                    self.q.put(data)
         return len(data)
 
     def flush(self):
@@ -298,13 +313,16 @@ def run_ocr(
     mode: 'gundam' — fast (640 px crop)
           'base'   — accurate (1024 px)
     """
-    if model is None:
+    with _model_state_lock:
+        current_model = model
+    if current_model is None:
         yield {"text": "Model is not loaded — pick a variant and press LOAD in the header.", "done": True}
         return
 
     path    = image_path["path"]
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
-    _temp_dirs.append(out_dir)
+    with _temp_dirs_lock:
+        _temp_dirs.append(out_dir)
 
     if mode == "gundam":
         base_size, image_size, crop_mode, ngram_window = 1024, 640,  True,  128
@@ -330,7 +348,7 @@ def run_ocr(
     def _infer_thread():
         try:
             with _infer_lock:
-                model.infer(tokenizer, **_infer_kwargs)
+                current_model.infer(tokenizer, **_infer_kwargs)
         except Exception as e:
             errors.append(str(e))
 
