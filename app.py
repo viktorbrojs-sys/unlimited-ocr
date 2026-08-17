@@ -44,11 +44,12 @@ _infer_lock = threading.Lock()
 
 app = Server()
 
-# UI variant selector → model-loading recipe. "auto" tries everything in order.
+# UI variant selector → model-loading recipe. "auto" tries CUDA bf16 first,
+# then falls back to CPU float32 (slow). Bitsandbytes quantization (8/4-bit)
+# is NOT compatible with this model's custom MoE + R-SWA architecture.
 _MODEL_VARIANTS: dict[str, str] = {
     "bf16": "CUDA bf16",
-    "8bit": "CUDA 8-bit quantized (bitsandbytes)",
-    "4bit": "CUDA 4-bit quantized (bitsandbytes)",
+    "cpu":  "CPU float32 (slow)",
 }
 
 
@@ -56,20 +57,17 @@ def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
     if name == "CUDA bf16":
         return dict(torch_dtype=torch.bfloat16), "cuda"
-    if name == "CUDA 8-bit quantized (bitsandbytes)":
-        return dict(load_in_8bit=True, device_map={"": 0}), None
-    if name == "CUDA 4-bit quantized (bitsandbytes)":
-        return dict(load_in_4bit=True, device_map={"": 0}), None
-    return dict(torch_dtype=torch.float32), "cpu"  # CPU float32
+    return dict(torch_dtype=torch.float32), "cpu"
 
 
 def _load_model_sync(variant: str, q) -> None:
     """Load the requested variant; push ("stage"|"done"|"error", text) into q.
 
-    Small-VRAM GPUs (<12 GB) OOM on the full bf16 weights (~6.7 GB + context +
-    activations), hence the bitsandbytes fallbacks. No CPU attempt while CUDA
-    is visible — the model's own infer() code sends inputs to cuda whenever
-    torch.cuda.is_available() and would crash against a CPU-resident model.
+    The model's own infer() code sends inputs to cuda whenever
+    torch.cuda.is_available(), so a CPU-resident model next to a visible GPU
+    crashes with "tensors on different devices". The CPU variant therefore
+    requires CUDA to be hidden — we signal this via a magic exit code so the
+    caller can re-exec the whole process with CUDA_VISIBLE_DEVICES="".
     """
     global tokenizer, model, _model_label
     if model is not None:
@@ -87,14 +85,17 @@ def _load_model_sync(variant: str, q) -> None:
     if not torch.cuda.is_available():
         names = ["CPU float32"]
     elif variant == "auto":
-        names = [_MODEL_VARIANTS["bf16"], _MODEL_VARIANTS["8bit"], _MODEL_VARIANTS["4bit"]]
+        names = ["CUDA bf16", "CPU float32 (restart)"]
     else:
-        names = [_MODEL_VARIANTS[variant]]
+        names = [_MODEL_VARIANTS.get(variant, variant)]
 
     last_err: Exception | None = None
     for name in names:
-        if name == "CPU float32":
-            q.put(("stage", "WARNING: CUDA not available — CPU mode will be slow."))
+        # CPU next to visible CUDA is impossible — signal caller to re-exec.
+        if "CPU" in name and torch.cuda.is_available():
+            q.put(("stage", "CPU mode requires hiding CUDA — the server will auto-restart..."))
+            q.put(("cpu_restart", ""))
+            return
         try:
             q.put(("stage", f"Loading model: {name}..."))
             kwargs, move_to = _variant_kwargs(name)
@@ -109,18 +110,14 @@ def _load_model_sync(variant: str, q) -> None:
         except Exception as e:
             last_err = e
             q.put(("stage", f"{name} failed: {e}"))
-            for dep in ("bitsandbytes", "accelerate"):
-                if dep in str(e):
-                    q.put(("stage", f"hint: .venv/bin/pip install {dep}"))
             model = None
             m = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     raise RuntimeError(
-        "Could not load the model. Install the quantization deps "
-        "('.venv/bin/pip install bitsandbytes accelerate') and try again, or pick "
-        f"a smaller variant. Last error: {last_err}"
+        "Could not load the model. "
+        f"(last error: {last_err})"
     )
 
 
@@ -129,6 +126,9 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
     """
     Load (or switch) the model on demand. Streams progress dicts:
     {"stage": str, "ready": bool, "label": str | None}
+
+    For "cpu" / "auto falling back to CPU": the server auto-restarts itself
+    with CUDA hidden so the model's infer() doesn't send tensors to a wrong device.
     """
     if variant != "auto" and variant not in _MODEL_VARIANTS:
         yield {"stage": f"Unknown variant: {variant}", "ready": False, "label": None}
@@ -159,6 +159,14 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
             elif kind == "done":
                 yield {"stage": f"Model ready: {msg}", "ready": True, "label": msg}
                 return
+            elif kind == "cpu_restart":
+                yield {"stage": "Restarting server in CPU mode...", "ready": False, "label": None}
+                # Re-exec self with CUDA hidden. The new process will serve on the same port
+                # (old one will die with the lock released).
+                import time
+                time.sleep(1)
+                env = {**os.environ, "UNLIMITED_OCR_CPU_REEXEC": "1", "CUDA_VISIBLE_DEVICES": ""}
+                os.execve(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]], env)
             elif kind == "error":
                 yield {"stage": f"FAILED: {msg}", "ready": False, "label": None}
                 return

@@ -261,10 +261,9 @@
     <div class="ngram-group">
       <span class="ngram-label">MODEL</span>
       <select id="model-select" class="model-select">
-        <option value="auto" selected>auto</option>
-        <option value="bf16">bf16 · ~7 GB</option>
-        <option value="8bit">8-bit · ~6 GB</option>
-        <option value="4bit">4-bit · ~3.5 GB</option>
+        <option value="auto" selected>auto (bf16 → CPU)</option>
+        <option value="bf16">bf16 · ~7 GB VRAM</option>
+        <option value="cpu">CPU · slow but works</option>
       </select>
       <button class="btn" id="load-btn" onclick="loadModel()">LOAD</button>
     </div>
