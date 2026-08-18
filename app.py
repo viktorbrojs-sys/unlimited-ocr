@@ -37,6 +37,7 @@ from fastapi.responses import HTMLResponse
 # without a GPU / without downloading the weights)
 # ──────────────────────────────────────────────────────────────────────────────
 MODEL_NAME = "baidu/Unlimited-OCR"
+MODEL_NAME_AWQ = "sahilchachra/Unlimited-OCR-AWQ"  # 4-bit quantized version (~3-4 GB)
 
 tokenizer = None
 model = None
@@ -45,6 +46,7 @@ _infer_lock = threading.Lock()
 _model_state_lock = threading.Lock()  # Separate lock for model state checks
 _temp_dirs: list[str] = []
 _temp_dirs_lock = threading.Lock()  # Protect _temp_dirs from concurrent access
+_cpu_fallback_message: str | None = None  # Message to show when CPU fallback occurs
 
 
 def _cleanup() -> None:
@@ -68,20 +70,34 @@ atexit.register(_cleanup)
 
 app = Server()
 
-# UI variant selector → model-loading recipe. "auto" tries CUDA bf16 first,
-# then falls back to CPU float32 (slow). Bitsandbytes quantization (8/4-bit)
-# is NOT compatible with this model's custom MoE + R-SWA architecture.
+# UI variant selector → model-loading recipe. "auto" tries AWQ first,
+# then bf16, then falls back to CPU float32 (slow).
 _MODEL_VARIANTS: dict[str, str] = {
-    "bf16": "CUDA bf16",
+    "awq":  "CUDA AWQ 4-bit (recommended)",
+    "bf16": "CUDA bf16 (full precision)",
     "cpu":  "CPU float32 (slow)",
 }
 
 
 def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
-    if name == "CUDA bf16":
+    global _cpu_fallback_message
+    if name == "CUDA AWQ 4-bit (recommended)":
+        # Load AWQ quantized model - uses less VRAM (~3-4 GB)
+        try:
+            from autoawq import AutoAWQForCausalLM
+            return dict(low_zero=True, device_map="auto"), "cuda"
+        except ImportError:
+            # Fallback to transformers with AWQ config
+            return dict(
+                torch_dtype=torch.float16,
+                device_map="auto",
+                use_safetensors=True
+            ), "cuda"
+    elif name == "CUDA bf16 (full precision)":
         return dict(dtype=torch.bfloat16), "cuda"
     # For CPU mode, explicitly ensure no CUDA device is used
+    _cpu_fallback_message = "Switched to CPU mode due to insufficient GPU memory. Performance will be slower."
     return dict(dtype=torch.float32, device_map="cpu"), "cpu"
 
 
@@ -94,24 +110,26 @@ def _load_model_sync(variant: str, q) -> None:
     requires CUDA to be hidden — we signal this via a magic exit code so the
     caller can re-exec the whole process with CUDA_VISIBLE_DEVICES="".
     """
-    global tokenizer, model, _model_label
+    global tokenizer, model, _model_label, _cpu_fallback_message
     with _model_state_lock:
         if model is not None:
-            q.put(("stage", "Unloading current model..."))
+            q.put((("stage", "Unloading current model...")))
             model = None
             _model_label = None
+            _cpu_fallback_message = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         if tokenizer is None:
-            q.put(("stage", "Loading tokenizer..."))
+            q.put((("stage", "Loading tokenizer...")))
             tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
     if not torch.cuda.is_available():
         names = ["CPU float32"]
     elif variant == "auto":
-        names = ["CUDA bf16", "CPU float32 (restart)"]
+        # Try AWQ first (smallest), then bf16, then CPU
+        names = ["CUDA AWQ 4-bit (recommended)", "CUDA bf16 (full precision)", "CPU float32 (restart)"]
     else:
         names = [_MODEL_VARIANTS.get(variant, variant)]
 
@@ -119,24 +137,28 @@ def _load_model_sync(variant: str, q) -> None:
     for name in names:
         # CPU next to visible CUDA is impossible — signal caller to re-exec.
         if "CPU" in name and torch.cuda.is_available():
-            q.put(("stage", "CPU mode requires hiding CUDA — the server will auto-restart..."))
-            q.put(("cpu_restart", ""))
+            q.put((("stage", "CPU mode requires hiding CUDA — the server will auto-restart...")))
+            q.put((("cpu_restart", "")))
             return
         try:
-            q.put(("stage", f"Loading model: {name}..."))
+            q.put((("stage", f"Loading model: {name}...")))
             kwargs, move_to = _variant_kwargs(name)
+            
+            # Determine which model name to use
+            model_name_to_use = MODEL_NAME_AWQ if "AWQ" in name else MODEL_NAME
+            
             m = AutoModel.from_pretrained(
-                MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
+                model_name_to_use, trust_remote_code=True, use_safetensors=True, **kwargs
             )
             m = m.eval().to(move_to) if move_to else m.eval()
             with _model_state_lock:
                 model = m
                 _model_label = name
-            q.put(("done", name))
+            q.put((("done", name)))
             return
         except Exception as e:
             last_err = e
-            q.put(("stage", f"{name} failed: {e}"))
+            q.put((("stage", f"{name} failed: {e}")))
             with _model_state_lock:
                 model = None
             m = None
@@ -154,7 +176,7 @@ def _target_labels(variant: str) -> list[str]:
     if not torch.cuda.is_available():
         return ["CPU float32"]
     if variant == "auto":
-        return ["CUDA bf16", "CPU float32 (restart)"]
+        return ["CUDA AWQ 4-bit (recommended)", "CUDA bf16 (full precision)", "CPU float32 (restart)"]
     return [_MODEL_VARIANTS.get(variant, variant)]
 
 
@@ -226,8 +248,12 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
 
 @app.api()
 def model_status() -> dict:
+    global _cpu_fallback_message
     with _model_state_lock:
-        return {"loaded": model is not None, "label": _model_label}
+        result = {"loaded": model is not None, "label": _model_label}
+        if _cpu_fallback_message:
+            result["notification"] = _cpu_fallback_message
+        return result
 
 
 # ── PDF helper — CPU only ─────────────────────────────────────────────────────

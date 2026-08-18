@@ -261,8 +261,9 @@
     <div class="ngram-group">
       <span class="ngram-label">MODEL</span>
       <select id="model-select" class="model-select">
-        <option value="auto" selected>auto (bf16 → CPU)</option>
-        <option value="bf16">bf16 · ~7 GB VRAM</option>
+        <option value="auto" selected>auto (AWQ → bf16 → CPU)</option>
+        <option value="awq">AWQ 4-bit · ~3-4 GB VRAM (recommended)</option>
+        <option value="bf16">bf16 · ~7 GB VRAM (full precision)</option>
         <option value="cpu">CPU · slow but works</option>
       </select>
       <button class="btn" id="load-btn" onclick="loadModel()">LOAD</button>
@@ -298,6 +299,11 @@
       <span class="meta-chip" id="page-info" style="display:none">PAGES <span id="page-count">1</span></span>
       <span class="meta-chip token-counter" id="token-display" style="display:none"><span id="char-count">0</span> chars</span>
     </div>
+  </div>
+
+  <!-- Notification bar (for CPU fallback messages) -->
+  <div class="progress-bar-wrap" id="notification-bar" style="display: none; background: var(--bg-surface); border-top: 1px solid var(--border);">
+    <div style="padding: 8px 20px; font-family: var(--font-mono); font-size: 10px; color: var(--teal); letter-spacing: 0.05em;" id="notification-text"></div>
   </div>
 
   <!-- Progress bar -->
@@ -428,7 +434,14 @@ async function _pollModelStatus() {
       modelReady = true;
       setStatus('idle', 'READY · ' + (st.label ?? 'model'));
       showToast('Model loaded');
+      // Show notification if CPU fallback occurred
+      if (st.notification) {
+        showNotification(st.notification);
+      }
       syncUI();
+    } else if (st.loaded && st.notification) {
+      // Model already loaded, but show notification if present
+      showNotification(st.notification);
     }
   } catch (_) { /* ignore polling errors */ }
 }
@@ -439,6 +452,7 @@ async function loadModel() {
   const variant = document.getElementById('model-select').value;
   btn.disabled  = true;
   modelReady    = false;
+  hideNotification(); // Clear any previous notifications
   syncUI();
   setStatus('running', 'LOADING MODEL · ' + variant.toUpperCase());
   try {
@@ -447,7 +461,14 @@ async function loadModel() {
       if (msg.type === 'data') {
         const d = msg.data?.[0] ?? {};
         if (d.stage) setStatus(d.ready ? 'idle' : 'running', d.stage.toUpperCase());
-        if (d.ready) { modelReady = true; showToast('Model loaded'); }
+        if (d.ready) { 
+          modelReady = true; 
+          showToast('Model loaded');
+          // Check for notification in the final response
+          if (d.notification) {
+            showNotification(d.notification);
+          }
+        }
       }
       if (msg.type === 'status' && msg.stage === 'complete') break;
     }
@@ -785,6 +806,22 @@ function showToast(msg) {
   t.classList.add('show');
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+function showNotification(msg) {
+  const bar = document.getElementById('notification-bar');
+  const text = document.getElementById('notification-text');
+  if (bar && text) {
+    text.textContent = '⚠ ' + msg;
+    bar.style.display = 'block';
+  }
+}
+
+function hideNotification() {
+  const bar = document.getElementById('notification-bar');
+  if (bar) {
+    bar.style.display = 'none';
+  }
 }
 </script>
 </body>
