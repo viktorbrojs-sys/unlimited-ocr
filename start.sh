@@ -76,29 +76,21 @@ echo ""
 echo -e "${YELLOW}Step 3: Installing dependencies...${NC}"
 pip install -q --upgrade pip
 
-# Install requirements (excluding torch if already installed)
+# Two-step install (see install.sh / README.md): transformers==4.57.1 pins
+# huggingface-hub<1.0 while gradio 6 needs >=1.16, so it must go in separately.
 if [ -f "requirements.txt" ]; then
     pip install -q -r requirements.txt
 fi
-
-# Install autoawq for quantized model support (Plan A - Priority 1)
-echo "Installing AWQ support..."
-pip install -q "autoawq>=0.2.6" 2>/dev/null || echo -e "${YELLOW}Warning: autoawq installation failed, falling back to standard mode${NC}"
+pip install -q "transformers==4.57.1"
 
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 echo ""
 
-# Step 4: Clear Gradio cache
+# Step 4: Clear Gradio cache (safe — this is only UI/temp-upload cache, not model weights)
 echo -e "${YELLOW}Step 4: Clearing Gradio cache...${NC}"
 rm -rf /tmp/gradio/*/ 2>/dev/null || true
 rm -rf .gradio_cache/ 2>/dev/null || true
 echo -e "${GREEN}✓ Cache cleared${NC}"
-echo ""
-
-# Step 5: Clear PyTorch CUDA cache (optional)
-echo -e "${YELLOW}Step 5: Clearing PyTorch CUDA cache...${NC}"
-rm -rf ~/.cache/torch/ 2>/dev/null || true
-echo -e "${GREEN}✓ PyTorch cache cleared${NC}"
 echo ""
 
 # Step 6: Start the application
@@ -111,21 +103,7 @@ echo -e "${GREEN}Server will start on http://127.0.0.1:$PORT${NC}"
 echo -e "${YELLOW}Press Ctrl+C to stop the server${NC}"
 echo ""
 
-# Handle port conflicts
-attempt=0
-max_attempts=5
-while [ $attempt -lt $max_attempts ]; do
-    if python $APP_FILE; then
-        break
-    else
-        attempt=$((attempt + 1))
-        if [ $attempt -lt $max_attempts ]; then
-            PORT=$((PORT + 1))
-            echo -e "${YELLOW}Port $((PORT-1)) is busy, trying port $PORT...${NC}"
-            sleep 2
-        else
-            echo -e "${RED}Error: Could not start server after $max_attempts attempts${NC}"
-            exit 1
-        fi
-    fi
-done
+# app.py already auto-increments PORT internally on OSError (busy port),
+# so we just run it once and let it handle that.
+export PORT
+python $APP_FILE

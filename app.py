@@ -16,10 +16,12 @@ Run:  python app.py   →  http://127.0.0.1:7860 (busy ports auto-increment)
 import atexit
 import gc
 import os
+import shutil
 import sys
 import queue
 import tempfile
 import threading
+import time
 from threading import Thread
 from typing import Iterator
 
@@ -43,8 +45,7 @@ tokenizer = None
 model = None
 _model_label: str | None = None
 _infer_lock = threading.Lock()
-_model_state_lock = threading.Lock()  # Separate lock for model state checks
-_model_state_lock = threading.Lock()  # Separate lock for model state checks
+_model_state_lock = threading.Lock()  # Protects model / tokenizer / _model_label
 _temp_dirs: list[str] = []
 _temp_dirs_lock = threading.Lock()  # Protect _temp_dirs from concurrent access
 _cpu_fallback_triggered = False  # Flag to track if CPU fallback was triggered
@@ -56,18 +57,7 @@ def _cleanup() -> None:
     with _model_state_lock:
         model = None
         tokenizer = None
-    with _model_state_lock:
-        model = None
-        tokenizer = None
     gc.collect()
-    import shutil
-    with _temp_dirs_lock:
-        for d in _temp_dirs[:]:  # Copy list to avoid modification during iteration
-            try:
-                shutil.rmtree(d, ignore_errors=True)
-            except Exception:
-                pass
-        _temp_dirs.clear()
     with _temp_dirs_lock:
         for d in _temp_dirs[:]:  # Copy list to avoid modification during iteration
             try:
@@ -95,17 +85,13 @@ def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
     global _cpu_fallback_triggered
     if name == "CUDA AWQ 4-bit (recommended)":
-        # Load AWQ quantized model - uses less VRAM (~3-4 GB)
-        try:
-            from autoawq import AutoAWQForCausalLM
-            return dict(low_zero=True, device_map="auto"), "cuda"
-        except ImportError:
-            # Fallback to transformers with AWQ config
-            return dict(
-                torch_dtype=torch.float16,
-                device_map="auto",
-                use_safetensors=True
-            ), "cuda"
+        # AWQ weights are pre-quantized; transformers loads them directly,
+        # no bitsandbytes/autoawq-specific kwargs are needed here.
+        return dict(
+            torch_dtype=torch.float16,
+            device_map="auto",
+            use_safetensors=True,
+        ), "cuda"
     elif name == "CUDA bf16 (full precision)":
         return dict(dtype=torch.bfloat16), "cuda"
     # For CPU mode, explicitly ensure no CUDA device is used
@@ -138,7 +124,7 @@ def _load_model_sync(variant: str, q) -> None:
 
     # Reset CPU fallback flag
     _cpu_fallback_triggered = False
-    
+
     if not torch.cuda.is_available():
         names = ["CPU float32 (slow)"]
     elif variant == "auto":
@@ -157,17 +143,14 @@ def _load_model_sync(variant: str, q) -> None:
         try:
             q.put(("stage", f"Loading model: {name}..."))
             kwargs, move_to = _variant_kwargs(name)
-            
+
             # Determine which model name to use
             model_name_to_use = MODEL_NAME_AWQ if "AWQ" in name else MODEL_NAME
-            
+
             m = AutoModel.from_pretrained(
                 model_name_to_use, trust_remote_code=True, use_safetensors=True, **kwargs
             )
             m = m.eval().to(move_to) if move_to else m.eval()
-            with _model_state_lock:
-                model = m
-                _model_label = name
             with _model_state_lock:
                 model = m
                 _model_label = name
@@ -201,13 +184,11 @@ def _load_model_sync(variant: str, q) -> None:
             q.put(("stage", f"{name} failed: {e}"))
             with _model_state_lock:
                 model = None
-            with _model_state_lock:
-                model = None
             m = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    
+
     # If we get here, all variants failed
     raise RuntimeError(
         "Could not load the model. "
@@ -232,7 +213,7 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
 
     For "cpu" / "auto falling back to CPU": the server auto-restarts itself
     with CUDA hidden so the model's infer() doesn't send tensors to a wrong device.
-    
+
     Notifies user when switching to CPU mode due to CUDA OOM.
     """
     if variant != "auto" and variant not in _MODEL_VARIANTS:
@@ -240,10 +221,6 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
         return
 
     # Skip reload if the model is already loaded with the requested variant.
-    with _model_state_lock:
-        current_label = _model_label
-    if current_label in _target_labels(variant):
-        yield {"stage": f"Model already loaded: {current_label}", "ready": True, "label": current_label}
     with _model_state_lock:
         current_label = _model_label
     if current_label in _target_labels(variant):
@@ -265,7 +242,6 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
             q.put(None)
 
     Thread(target=_worker, daemon=True).start()
-    lock_held = True
     lock_held = True
     try:
         while True:
@@ -303,7 +279,6 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
                 return
             elif kind == "cpu_restart":
                 yield {"stage": "Restarting server in CPU mode...", "ready": False, "label": None}
-                import time
                 time.sleep(1)
                 env = {**os.environ, "UNLIMITED_OCR_CPU_REEXEC": "1", "CUDA_VISIBLE_DEVICES": ""}
                 os.execve(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]], env)
@@ -313,14 +288,10 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
     finally:
         if lock_held:
             _infer_lock.release()
-        if lock_held:
-            _infer_lock.release()
 
 
 @app.api()
 def model_status() -> dict:
-    with _model_state_lock:
-        return {"loaded": model is not None, "label": _model_label}
     with _model_state_lock:
         return {"loaded": model is not None, "label": _model_label}
 
@@ -331,8 +302,6 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
     import fitz
     doc = fitz.open(pdf_path)
     tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
-    with _temp_dirs_lock:
-        _temp_dirs.append(tmp_dir)
     with _temp_dirs_lock:
         _temp_dirs.append(tmp_dir)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
@@ -348,25 +317,14 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
 def _collect_output(out_dir: str) -> str:
     """Read all text/markdown files written by model.infer()."""
     # Wait a bit for the model to finish writing files
-    import time
     time.sleep(0.5)
-    
-    # Wait a bit for the model to finish writing files
-    import time
-    time.sleep(0.5)
-    
+
+    try:
+        files = sorted(os.listdir(out_dir))
+    except Exception:
+        return ""
+
     result = ""
-    try:
-        files = sorted(os.listdir(out_dir))
-    except Exception:
-        return ""
-    
-    for fname in files:
-    try:
-        files = sorted(os.listdir(out_dir))
-    except Exception:
-        return ""
-    
     for fname in files:
         if fname.endswith((".txt", ".md")):
             fpath = os.path.join(out_dir, fname)
@@ -377,20 +335,9 @@ def _collect_output(out_dir: str) -> str:
                         result += content + "\n"
             except Exception:
                 pass
-    
-    # If no .txt/.md files found, try to read any file
-            fpath = os.path.join(out_dir, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    if content:
-                        result += content + "\n"
-            except Exception:
-                pass
-    
+
     # If no .txt/.md files found, try to read any file
     if not result:
-        for fname in files:
         for fname in files:
             fpath = os.path.join(out_dir, fname)
             if os.path.isfile(fpath):
@@ -399,14 +346,9 @@ def _collect_output(out_dir: str) -> str:
                         content = f.read().strip()
                         if content:
                             result += content + "\n"
-                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read().strip()
-                        if content:
-                            result += content + "\n"
                 except Exception:
                     pass
-    
-    
+
     return result.strip()
 
 
@@ -423,18 +365,10 @@ class ThreadTargetedStdout:
         self.q = q
         self.original_stdout = original_stdout
         self._lock = threading.Lock()
-        self._lock = threading.Lock()
 
     def write(self, data):
         self.original_stdout.write(data)
         self.original_stdout.flush()
-        with self._lock:
-            if threading.current_thread() is self.target_thread:
-                if data:
-                    lower_data = data.lower()
-                    if "tps:" in lower_data or "tokens/s" in lower_data:
-                        return len(data)
-                    self.q.put(data)
         with self._lock:
             if threading.current_thread() is self.target_thread:
                 if data:
@@ -468,16 +402,11 @@ def run_ocr(
     with _model_state_lock:
         current_model = model
     if current_model is None:
-    with _model_state_lock:
-        current_model = model
-    if current_model is None:
         yield {"text": "Model is not loaded — pick a variant and press LOAD in the header.", "done": True}
         return
 
     path    = image_path["path"]
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
-    with _temp_dirs_lock:
-        _temp_dirs.append(out_dir)
     with _temp_dirs_lock:
         _temp_dirs.append(out_dir)
 
@@ -506,7 +435,6 @@ def run_ocr(
         try:
             with _infer_lock:
                 current_model.infer(tokenizer, **_infer_kwargs)
-                current_model.infer(tokenizer, **_infer_kwargs)
         except Exception as e:
             errors.append(str(e))
 
@@ -533,20 +461,6 @@ def run_ocr(
     # ── Fallback/Final: read file to get clean text ───────────────────────────
     full_text = _collect_output(out_dir)
 
-    if full_text:
-        # Stream the final result word by word for better UX
-        words = full_text.split()
-        acc = ""
-        for i, word in enumerate(words):
-            acc += ("" if i == 0 else " ") + word
-            if i % 5 == 0 or i == len(words) - 1:
-                yield {"text": acc, "done": i == len(words) - 1}
-    elif accumulated:
-        yield {"text": accumulated, "done": True}
-    else:
-        if errors:
-            raise RuntimeError(f"Inference failed: {', '.join(errors)}")
-        yield {"text": "", "done": True}
     if full_text:
         # Stream the final result word by word for better UX
         words = full_text.split()
