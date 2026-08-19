@@ -1,5 +1,5 @@
 #!/bin/bash
-# Unlimited OCR - Start Script v1.2.0-AWQ
+# Unlimited OCR - Start Script v1.2.1
 # This script updates the project from GitHub, cleans cache, and starts the application
 
 set -e
@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║     Unlimited OCR - Start Script v1.2.0-AWQ           ║${NC}"
+echo -e "${BLUE}║     Unlimited OCR - Start Script v1.2.1               ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════╝${NC}"
 echo ""
 

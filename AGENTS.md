@@ -1,76 +1,50 @@
-#программирование #разработка #backend #AI/ML #OCR #vibecode
+# AGENTS.md
 
----
-## Version Control (simplified for Unlimited-OCR project)
+Инструкция для AI-агентов (и разработчиков), работающих в этом репозитории.
 
-### 1. Repository & Branch
-- The entire project lives in a GitHub repository: **https://github.com/viktorbrojs-sys/unlimited-ocr**
-- There is **only one main branch** – `main`.  
-  All changes are committed directly to `main`.  
-  If you are working on a large feature that might break things, you may create a **temporary branch** (e.g., `feature/batch-processing`) and merge it back into `main` after completion. For most cases, committing straight to `main` is sufficient.
+## Обязательно прочитать перед изменениями
 
-### 2. Versioning (tags)
-- Releases are marked with **tags** in the format `vX.Y.Z` (e.g., `v1.0.0`).
-- The version number follows **SemVer** rules (single version for the whole application):
-  - **X (major)** – global, breaking changes (architecture overhaul, removal of key features, API contract changes).
-  - **Y (minor)** – new functionality (new screens, new export formats, significant UI redesign).
-  - **Z (patch)** – minor bug fixes, small UI tweaks, text corrections, documentation updates.
+1. [`README.md`](README.md) — что делает проект, установка, запуск.
+2. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — устройство `app.py`,
+   блокировки, поток данных. **Особенно важно** перед изменением чего-либо
+   в `_load_model_sync`, `run_ocr`, `load_model` — там неочевидная логика
+   синхронизации потоков и CPU/CUDA-рестарта, легко сломать тихо.
+3. [`ROADMAP.md`](ROADMAP.md) — что уже сделано, что запланировано.
+   Не переизобретайте то, что уже есть в разделе "Готово".
+4. [`CHANGELOG.md`](CHANGELOG.md) — история версий.
+5. [`CONTRIBUTING.md`](CONTRIBUTING.md) — процесс: ветки, коммиты,
+   версионирование, релизы.
 
-### 3. Commits
-- All commits must follow the **[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)** specification.
-- Format: `<type>(<scope>): <description>`
-  - **Type**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`.
-  - **Scope** (optional): `frontend`, `backend`, `model`, `docs`, `install`, `pdf`, `api`, etc.
-  - **Description** – brief, in the imperative mood (e.g., "add", "fix").
-- Examples:  
-  `feat(backend): add batch file upload endpoint`  
-  `fix(model): handle CUDA OOM gracefully`  
-  `docs: update PROJECT_DOCS with roadmap`  
-  `perf(pdf): reduce memory footprint for large PDFs`
+## Быстрая проверка перед коммитом
 
-### 4. Documentation Files
-- `README.md` — краткое руководство для пользователей (быстрый старт)
-- `PROJECT_DOCS.md` — полная документация проекта (архитектура, технические детали, планы развития)
-- `CHANGELOG.md` — история изменений по версиям (Keep a Changelog формат)
-- `AGENTS.md` — этот файл, инструкция для AI-агентов и разработчиков
+```bash
+python3 -m py_compile app.py
+bash -n start.sh && sh -n install.sh
+```
 
-### 5. CHANGELOG
-- A `CHANGELOG.md` file exists in the project root.
-- For each release (tag), add a new entry with the changes in the **[Keep a Changelog](https://keepachangelog.com/en/1.0.0/)** format:
-  - `Added` – new features
-  - `Changed` – changes to existing functionality
-  - `Deprecated` – soon‑to‑be removed features
-  - `Removed` – removed features
-  - `Fixed` – bug fixes
-  - `Security` – security improvements
+Файл `app.py` в прошлом ломался из-за продублированных блоков кода после
+неаккуратного слияния/рефакторинга — эта проверка ловит такое мгновенно.
+CI (`.github/workflows/syntax-check.yml`) делает то же самое на каждый
+push/PR, но лучше поймать до коммита.
 
-### 6. Creating a release
-When enough changes have accumulated and everything is tested:
-1. Make sure all necessary commits are already in `main`.
-2. Update `CHANGELOG.md` with the new version entries.
-3. Create a tag with the new version:
-   ```bash
-   git tag -a v1.0.0 -m "Release 1.0.0"
-   git push origin v1.0.0
-   ```
+## Правила репозитория
 
-### 7. Dependencies
-- `requirements.txt` **must** be committed — this guarantees identical package versions across all developers and servers.
-- Update dependencies regularly, but with caution (test the application after updating).
-- Pay attention to version conflicts (see PROJECT_DOCS.md for known conflicts between gradio 6 and transformers 4.57.1).
+- **Не коммитьте секреты** (токены, ключи, `.env`) — `.gitignore` уже
+  исключает `*.env`, но перепроверяйте вручную перед `git add -A`.
+- **Не коммитьте личные/внутренние заметки** (свои "memory"-файлы,
+  разовые инструкции по миграции для конкретной машины и т.п.) — если
+  агенту нужна заметка "для себя", она должна жить вне репозитория.
+  Прецедент: в прошлом сюда случайно попала папка `memory/` с личным
+  email пользователя — не повторяйте эту ошибку.
+- **Одна правда для документации.** Не создавайте новый
+  `PROJECT_DOCS_v2.md`/`NOTES.md` — правьте существующие
+  `README.md`/`docs/ARCHITECTURE.md`/`ROADMAP.md`/`CHANGELOG.md`.
+  Дублирующиеся источники правды расходятся и вводят в заблуждение.
+- Версия проекта — в файле `VERSION`, дублируется в `index.html`
+  (`#app-version`). При релизе обновляйте оба места (см. `CONTRIBUTING.md`).
 
-### 8. Documentation & Memory
-- In `README.md`, briefly describe the branch and commit workflow (you can link to this section).
-- This section in `AGENTS.md` serves as the main guideline for everyone contributing to the project.
-- **Always read `PROJECT_DOCS.md` before making significant changes** to understand the architecture, technical decisions, and development plans.
-- `PROJECT_DOCS.md` contains the project "memory" — what was done, what is being done, and what is planned. This is critical for AI agents to maintain context across sessions.
+## Формат коммитов и версионирование
 
-### 9. Working Without GitHub Access
-- If you cannot access the GitHub repository directly, work locally in the `/workspace` directory.
-- All changes should still follow the commit message format and be documented in `CHANGELOG.md`.
-- When GitHub access is restored, sync your local changes with the remote repository.
-
----
-
-*Last updated: August 2024*  
-*Document version: 1.0.0*
+Кратко — [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
++ [SemVer](https://semver.org/lang/ru/). Полное описание процесса — в
+[`CONTRIBUTING.md`](CONTRIBUTING.md), не дублируется здесь.
