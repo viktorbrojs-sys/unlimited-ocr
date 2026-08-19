@@ -405,76 +405,87 @@ def run_ocr(
         yield {"text": "Model is not loaded — pick a variant and press LOAD in the header.", "done": True}
         return
 
-    path    = image_path["path"]
-    out_dir = tempfile.mkdtemp(prefix="ocr_out_")
-    with _temp_dirs_lock:
-        _temp_dirs.append(out_dir)
+    # Hold the inference lock for the whole request (not just inside the
+    # worker thread) so a concurrent load_model() call — which also takes
+    # this lock — cannot swap/unload the model while we're mid-inference.
+    if not _infer_lock.acquire(blocking=False):
+        yield {"text": "Another OCR run or model load is in progress — please wait.", "done": True}
+        return
 
-    if mode == "gundam":
-        base_size, image_size, crop_mode, ngram_window = 1024, 640,  True,  128
-    else:
-        base_size, image_size, crop_mode, ngram_window = 1024, 1024, False, 128
-
-    _infer_kwargs = dict(
-        prompt=f"<image>{prompt}",
-        image_file=path,
-        output_path=out_dir,
-        base_size=base_size,
-        image_size=image_size,
-        crop_mode=crop_mode,
-        max_length=8192,
-        no_repeat_ngram_size=35,
-        ngram_window=ngram_window,
-        save_results=True,
-    )
-
-    q = queue.Queue()
-    errors = []
-
-    def _infer_thread():
-        try:
-            with _infer_lock:
-                current_model.infer(tokenizer, **_infer_kwargs)
-        except Exception as e:
-            errors.append(str(e))
-
-    thread = Thread(target=_infer_thread, daemon=True)
-
-    original_stdout = sys.stdout
-    targeted_stdout = ThreadTargetedStdout(thread, q, original_stdout)
-    sys.stdout = targeted_stdout
-
-    accumulated = ""
     try:
-        thread.start()
-        while thread.is_alive() or not q.empty():
+        path    = image_path["path"]
+        out_dir = tempfile.mkdtemp(prefix="ocr_out_")
+        with _temp_dirs_lock:
+            _temp_dirs.append(out_dir)
+
+        if mode == "gundam":
+            base_size, image_size, crop_mode, ngram_window = 1024, 640,  True,  128
+        else:
+            base_size, image_size, crop_mode, ngram_window = 1024, 1024, False, 128
+
+        _infer_kwargs = dict(
+            prompt=f"<image>{prompt}",
+            image_file=path,
+            output_path=out_dir,
+            base_size=base_size,
+            image_size=image_size,
+            crop_mode=crop_mode,
+            max_length=8192,
+            no_repeat_ngram_size=35,
+            ngram_window=ngram_window,
+            save_results=True,
+        )
+
+        q = queue.Queue()
+        errors = []
+
+        def _infer_thread():
+            # _infer_lock is already held by the outer generator (see above) —
+            # do not re-acquire it here, this thread just does the actual work.
             try:
-                chunk = q.get(timeout=0.02)
-                accumulated += chunk
-                yield {"text": accumulated, "done": False}
-            except queue.Empty:
-                continue
+                current_model.infer(tokenizer, **_infer_kwargs)
+            except Exception as e:
+                errors.append(str(e))
+
+        thread = Thread(target=_infer_thread, daemon=True)
+
+        original_stdout = sys.stdout
+        targeted_stdout = ThreadTargetedStdout(thread, q, original_stdout)
+        sys.stdout = targeted_stdout
+
+        accumulated = ""
+        try:
+            thread.start()
+            while thread.is_alive() or not q.empty():
+                try:
+                    chunk = q.get(timeout=0.02)
+                    accumulated += chunk
+                    yield {"text": accumulated, "done": False}
+                except queue.Empty:
+                    continue
+        finally:
+            sys.stdout = original_stdout
+            thread.join()
+
+        # ── Fallback/Final: read file to get clean text ───────────────────────
+        full_text = _collect_output(out_dir)
+
+        if full_text:
+            # Stream the final result word by word for better UX
+            words = full_text.split()
+            acc = ""
+            for i, word in enumerate(words):
+                acc += ("" if i == 0 else " ") + word
+                if i % 5 == 0 or i == len(words) - 1:
+                    yield {"text": acc, "done": i == len(words) - 1}
+        elif accumulated:
+            yield {"text": accumulated, "done": True}
+        else:
+            if errors:
+                raise RuntimeError(f"Inference failed: {', '.join(errors)}")
+            yield {"text": "", "done": True}
     finally:
-        sys.stdout = original_stdout
-        thread.join()
-
-    # ── Fallback/Final: read file to get clean text ───────────────────────────
-    full_text = _collect_output(out_dir)
-
-    if full_text:
-        # Stream the final result word by word for better UX
-        words = full_text.split()
-        acc = ""
-        for i, word in enumerate(words):
-            acc += ("" if i == 0 else " ") + word
-            if i % 5 == 0 or i == len(words) - 1:
-                yield {"text": acc, "done": i == len(words) - 1}
-    elif accumulated:
-        yield {"text": accumulated, "done": True}
-    else:
-        if errors:
-            raise RuntimeError(f"Inference failed: {', '.join(errors)}")
-        yield {"text": "", "done": True}
+        _infer_lock.release()
 
 
 # ── PDF explode — CPU only ───────────────────────────────────────────────────

@@ -3,3 +3,16 @@ __pycache__/
 *.pyc
 .zcode/
 *.tar
+
+# Runtime temp output / caches
+ocr_out_*/
+pdf_ocr_*/
+.gradio_cache/
+
+# Editors / OS
+.DS_Store
+*.swp
+
+# Secrets — never commit tokens/keys
+*.env
+.env.*
