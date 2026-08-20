@@ -29,6 +29,15 @@ from typing import Iterator
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+
+if not torch.cuda.is_available():
+    # Некоторые модели (например, remote-код baidu/Unlimited-OCR в его infer())
+    # жёстко вызывают .cuda() на тензорах, игнорируя фактическое устройство
+    # модели (device_map='cpu'). Когда CUDA намеренно скрыта для форсированного
+    # CPU-режима, делаем .cuda() безопасным no-op вместо падения с
+    # "No CUDA GPUs are available".
+    torch.Tensor.cuda = lambda self, *args, **kwargs: self
+
 from transformers import AutoModel, AutoTokenizer
 from gradio import Server
 from gradio.data_classes import FileData
