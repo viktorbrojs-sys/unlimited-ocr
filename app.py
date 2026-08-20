@@ -493,23 +493,39 @@ def run_ocr(
 
         # ── Fallback/Final: read file to get clean text ───────────────────────
         full_text = _collect_output(out_dir)
-
-        if full_text:
-            # Stream the final result word by word for better UX
-            words = full_text.split()
-            acc = ""
-            for i, word in enumerate(words):
-                acc += ("" if i == 0 else " ") + word
-                if i % 5 == 0 or i == len(words) - 1:
-                    yield {"text": acc, "done": i == len(words) - 1}
-        elif accumulated:
-            yield {"text": accumulated, "done": True}
-        else:
-            if errors:
-                raise RuntimeError(f"Inference failed: {', '.join(errors)}")
-            yield {"text": "", "done": True}
     finally:
+        # Release the lock as soon as the model is actually done with this
+        # request (inference thread joined, result file already read) —
+        # do NOT wait for this generator to reach its own natural end.
+        #
+        # Why: everything below is just replaying already-collected text to
+        # the client for the UI (no model/GPU access anymore). If we kept
+        # the lock held until the generator's implicit end-of-function
+        # `return`, we'd depend on the SSE-streaming wrapper calling next()
+        # one extra time *after* it has already seen a payload with
+        # "done": True. Some streaming implementations treat "done": True
+        # as "no more messages will arrive" and simply stop driving the
+        # generator at that point — the generator (and this `finally`)
+        # then never actually runs, and the lock stays held forever, which
+        # is exactly the "Another OCR run or model load is in progress"
+        # hang seen after a run that otherwise completed successfully.
+        # Releasing here removes that dependency entirely.
         _infer_lock.release()
+
+    if full_text:
+        # Stream the final result character by character (matches the
+        # reference Baidu Space's typewriter-style output) instead of in
+        # 5-word chunks.
+        acc = ""
+        for i, ch in enumerate(full_text):
+            acc += ch
+            yield {"text": acc, "done": i == len(full_text) - 1}
+    elif accumulated:
+        yield {"text": accumulated, "done": True}
+    else:
+        if errors:
+            raise RuntimeError(f"Inference failed: {', '.join(errors)}")
+        yield {"text": "", "done": True}
 
 
 # ── PDF explode — CPU only ───────────────────────────────────────────────────
