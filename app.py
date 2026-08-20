@@ -31,12 +31,14 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import torch
 
 if not torch.cuda.is_available():
-    # Некоторые модели (например, remote-код baidu/Unlimited-OCR в его infer())
-    # жёстко вызывают .cuda() на тензорах, игнорируя фактическое устройство
-    # модели (device_map='cpu'). Когда CUDA намеренно скрыта для форсированного
-    # CPU-режима, делаем .cuda() безопасным no-op вместо падения с
-    # "No CUDA GPUs are available".
+    # Некоторые модели (например, remote-код baidu/Unlimited-OCR) жёстко
+    # вызывают .cuda() и приводят тензоры к bfloat16 в расчёте на GPU,
+    # игнорируя фактическое устройство модели (device_map='cpu').
+    # Делаем .cuda() безопасным no-op и переопределяем torch.bfloat16
+    # на torch.float32, чтобы все .to(torch.bfloat16) в чужом коде
+    # автоматически совпадали с float32-весами CPU-модели.
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
+    torch.bfloat16 = torch.float32
 
 from transformers import AutoModel, AutoTokenizer
 from gradio import Server
