@@ -46,7 +46,6 @@ from fastapi.responses import HTMLResponse
 # without a GPU / without downloading the weights)
 # ──────────────────────────────────────────────────────────────────────────────
 MODEL_NAME = "baidu/Unlimited-OCR"
-MODEL_NAME_AWQ = "sahilchachra/Unlimited-OCR-AWQ"  # 4-bit quantized version (~3-4 GB)
 
 tokenizer = None
 model = None
@@ -78,11 +77,17 @@ atexit.register(_cleanup)
 
 app = Server()
 
-# UI variant selector → model-loading recipe. "auto" tries AWQ on GPU first,
+# UI variant selector → model-loading recipe. "auto" tries CUDA bf16 first,
 # then falls back to CPU float32 (slow). Bitsandbytes quantization (8/4-bit)
 # is NOT compatible with this model's custom MoE + R-SWA architecture.
+#
+# AWQ (sahilchachra/Unlimited-OCR-AWQ, community requantization) was tried
+# and removed in 1.2.3: `compressed-tensors` decompresses the weights to
+# fp16 at inference time, so there is no actual VRAM or speed benefit at
+# runtime (only a smaller download) — while still carrying the accuracy
+# risk of an unofficial, third-party quantization of an OCR model, where
+# accuracy is the entire point. Net negative, no upside; see CHANGELOG.
 _MODEL_VARIANTS: dict[str, str] = {
-    "awq":   "CUDA AWQ 4-bit (recommended)",
     "bf16":  "CUDA bf16 (full precision)",
     "cpu":   "CPU float32 (slow)",
 }
@@ -91,18 +96,7 @@ _MODEL_VARIANTS: dict[str, str] = {
 def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
     global _cpu_fallback_triggered
-    if name == "CUDA AWQ 4-bit (recommended)":
-        # AWQ weights are pre-quantized; transformers loads them directly,
-        # no bitsandbytes/autoawq-specific kwargs are needed here.
-        # NOTE: use_safetensors is passed explicitly by the caller
-        # (from_pretrained(..., use_safetensors=True, **kwargs)) — do not
-        # duplicate it here, or from_pretrained() raises
-        # "got multiple values for keyword argument 'use_safetensors'".
-        return dict(
-            torch_dtype=torch.float16,
-            device_map="auto",
-        ), "cuda"
-    elif name == "CUDA bf16 (full precision)":
+    if name == "CUDA bf16 (full precision)":
         return dict(dtype=torch.bfloat16), "cuda"
     # For CPU mode, explicitly ensure no CUDA device is used
     _cpu_fallback_triggered = True
@@ -138,8 +132,8 @@ def _load_model_sync(variant: str, q) -> None:
     if not torch.cuda.is_available():
         names = ["CPU float32 (slow)"]
     elif variant == "auto":
-        # Try AWQ first (smallest), then bf16, then CPU
-        names = ["CUDA AWQ 4-bit (recommended)", "CUDA bf16 (full precision)", "CPU float32 (slow)"]
+        # Try CUDA bf16 first, then CPU
+        names = ["CUDA bf16 (full precision)", "CPU float32 (slow)"]
     else:
         names = [_MODEL_VARIANTS.get(variant, variant)]
 
@@ -153,12 +147,8 @@ def _load_model_sync(variant: str, q) -> None:
         try:
             q.put(("stage", f"Loading model: {name}..."))
             kwargs, move_to = _variant_kwargs(name)
-
-            # Determine which model name to use
-            model_name_to_use = MODEL_NAME_AWQ if "AWQ" in name else MODEL_NAME
-
             m = AutoModel.from_pretrained(
-                model_name_to_use, trust_remote_code=True, use_safetensors=True, **kwargs
+                MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
             )
             m = m.eval().to(move_to) if move_to else m.eval()
             with _model_state_lock:
@@ -211,7 +201,7 @@ def _target_labels(variant: str) -> list[str]:
     if not torch.cuda.is_available():
         return ["CPU float32 (slow)"]
     if variant == "auto":
-        return ["CUDA AWQ 4-bit (recommended)", "CUDA bf16 (full precision)", "CPU float32 (slow)"]
+        return ["CUDA bf16 (full precision)", "CPU float32 (slow)"]
     return [_MODEL_VARIANTS.get(variant, variant)]
 
 

@@ -239,7 +239,7 @@
   <header>
     <div class="logo-area">
       <div class="logo-icon">📄</div>
-      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.2.2</span></span>
+      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.2.3</span></span>
     </div>
     <div class="header-sep"></div>
 
@@ -261,8 +261,7 @@
     <div class="ngram-group">
       <span class="ngram-label">MODEL</span>
       <select id="model-select" class="model-select">
-        <option value="auto" selected>auto (AWQ → bf16 → CPU)</option>
-        <option value="awq">AWQ 4-bit · ~3-4 GB VRAM (recommended)</option>
+        <option value="auto" selected>auto (bf16 → CPU)</option>
         <option value="bf16">bf16 · ~7 GB VRAM (full precision)</option>
         <option value="cpu">CPU · slow but works</option>
       </select>
