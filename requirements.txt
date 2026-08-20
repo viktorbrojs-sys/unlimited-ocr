@@ -16,3 +16,4 @@ Pillow>=10.0.0
 autoawq>=0.2.6
 # Optional — automatic quantized fallback for GPUs with <12 GB VRAM:
 # bitsandbytes>=0.45
+compressed-tensors
