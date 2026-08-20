@@ -87,10 +87,13 @@ def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     if name == "CUDA AWQ 4-bit (recommended)":
         # AWQ weights are pre-quantized; transformers loads them directly,
         # no bitsandbytes/autoawq-specific kwargs are needed here.
+        # NOTE: use_safetensors is passed explicitly by the caller
+        # (from_pretrained(..., use_safetensors=True, **kwargs)) — do not
+        # duplicate it here, or from_pretrained() raises
+        # "got multiple values for keyword argument 'use_safetensors'".
         return dict(
             torch_dtype=torch.float16,
             device_map="auto",
-            use_safetensors=True,
         ), "cuda"
     elif name == "CUDA bf16 (full precision)":
         return dict(dtype=torch.bfloat16), "cuda"
