@@ -32,13 +32,9 @@ import torch
 
 if not torch.cuda.is_available():
     # Некоторые модели (например, remote-код baidu/Unlimited-OCR) жёстко
-    # вызывают .cuda() и приводят тензоры к bfloat16 в расчёте на GPU,
-    # игнорируя фактическое устройство модели (device_map='cpu').
-    # Делаем .cuda() безопасным no-op и переопределяем torch.bfloat16
-    # на torch.float32, чтобы все .to(torch.bfloat16) в чужом коде
-    # автоматически совпадали с float32-весами CPU-модели.
+    # вызывают .cuda() в расчёте на GPU, игнорируя фактическое устройство
+    # модели (device_map='cpu'). Делаем .cuda() безопасным no-op.
     torch.Tensor.cuda = lambda self, *args, **kwargs: self
-    torch.bfloat16 = torch.float32
 
 from transformers import AutoModel, AutoTokenizer
 from gradio import Server
@@ -452,17 +448,31 @@ def run_ocr(
 
         q = queue.Queue()
         errors = []
-
         def _infer_thread():
             # _infer_lock is already held by the outer generator (see above) —
             # do not re-acquire it here, this thread just does the actual work.
             try:
-                current_model.infer(tokenizer, **_infer_kwargs)
+                if not torch.cuda.is_available():
+                    # Веса модели уже загружены корректно (bfloat16 не
+                    # подменялся на этапе импорта/загрузки). Здесь, только на
+                    # время самого inference-вызова, временно подменяем
+                    # torch.bfloat16 на float32 — так remote-код модели,
+                    # который жёстко приводит входное изображение к
+                    # .to(torch.bfloat16), получит тип, совпадающий с
+                    # float32-весами CPU-модели.
+                    _orig_bfloat16 = torch.bfloat16
+                    torch.bfloat16 = torch.float32
+                    try:
+                        current_model.infer(tokenizer, **_infer_kwargs)
+                    finally:
+                        torch.bfloat16 = _orig_bfloat16
+                else:
+                    current_model.infer(tokenizer, **_infer_kwargs)
             except Exception as e:
                 errors.append(str(e))
-
         thread = Thread(target=_infer_thread, daemon=True)
 
+      
         original_stdout = sys.stdout
         targeted_stdout = ThreadTargetedStdout(thread, q, original_stdout)
         sys.stdout = targeted_stdout
