@@ -239,7 +239,7 @@
   <header>
     <div class="logo-area">
       <div class="logo-icon">📄</div>
-      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.2</span></span>
+      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.3</span></span>
     </div>
     <div class="header-sep"></div>
 
@@ -395,7 +395,7 @@
 <div class="toast" id="toast"></div>
 
 <script type="module">
-import { Client, handle_file } from "https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js";
+import { Client, handle_file } from "https://cdn.jsdelivr.net/npm/@gradio/client@2.2.1/dist/index.min.js";
 import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs";
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
@@ -414,6 +414,65 @@ let charCount     = 0;
 let zoomedOut     = false;
 let modelReady    = false;
 let loadedVariant = null; // 'bf16' | 'cpu' | null — what's actually loaded server-side
+let isConnecting  = false;
+let connectAttempts = 0;
+const MAX_AUTO_CONNECT_ATTEMPTS = 20; // ~ up to ~30s of auto-retries with backoff below
+const CONNECT_TIMEOUT_MS = 8000;
+
+// ── Client connection (with timeout + auto-retry, since Client.connect()
+// can hang or fail silently — e.g. after a CDN client-library update that
+// doesn't match the pinned server-side gradio version, or simply because
+// the server is still mid-restart). Logs every attempt to the console so
+// the browser DevTools console (F12) shows exactly what's happening if it
+// still doesn't work — the raw error there is the most useful thing to
+// share for further diagnosis.
+async function _connectClient() {
+  isConnecting = true;
+  client = null;
+  connectAttempts = 0;
+  _updateLoadButtonState();
+
+  while (connectAttempts < MAX_AUTO_CONNECT_ATTEMPTS) {
+    connectAttempts += 1;
+    setStatus('running', `CONNECTING TO SERVER… (${connectAttempts}/${MAX_AUTO_CONNECT_ATTEMPTS})`);
+    console.log(`[unlimited-ocr] Client.connect() attempt ${connectAttempts}/${MAX_AUTO_CONNECT_ATTEMPTS}...`);
+    try {
+      const c = await Promise.race([
+        Client.connect(window.location.origin),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('connect timeout after ' + CONNECT_TIMEOUT_MS + 'ms')), CONNECT_TIMEOUT_MS)),
+      ]);
+      client = c;
+      isConnecting = false;
+      console.log('[unlimited-ocr] Client.connect() succeeded.');
+      _updateLoadButtonState();
+      return true;
+    } catch (e) {
+      console.error(`[unlimited-ocr] Client.connect() attempt ${connectAttempts} failed:`, e);
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+  isConnecting = false;
+  setStatus('error', 'НЕ УДАЁТСЯ ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ · нажмите LOAD, чтобы попробовать снова (детали в консоли браузера, F12)');
+  _updateLoadButtonState();
+  return false;
+}
+
+async function _refreshModelStatus() {
+  try {
+    const res = await client.predict('/model_status', {});
+    const st  = res?.data?.[0] ?? {};
+    if (st.loaded) {
+      modelReady = true;
+      loadedVariant = _variantFromLabel(st.label);
+      setStatus('idle', 'READY · ' + (st.label ?? 'model'));
+    } else {
+      setStatus('idle', 'MODEL NOT LOADED · pick a device/model and press LOAD');
+    }
+  } catch (e) {
+    console.error('[unlimited-ocr] /model_status failed:', e);
+    setStatus('error', 'STATUS CHECK ERROR · ' + e.message);
+  }
+}
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
@@ -429,20 +488,8 @@ async function boot() {
     window.history.replaceState({}, '', cleanUrl);
   }
 
-  try {
-    client = await Client.connect(window.location.origin);
-    const res  = await client.predict('/model_status', {});
-    const st   = res?.data?.[0] ?? {};
-    if (st.loaded) {
-      modelReady = true;
-      loadedVariant = _variantFromLabel(st.label);
-      setStatus('idle', 'READY · ' + (st.label ?? 'model'));
-    } else {
-      setStatus('idle', 'MODEL NOT LOADED · pick a device/model and press LOAD');
-    }
-  } catch (e) {
-    setStatus('error', 'CONNECTION ERROR · ' + e.message);
-  }
+  const ok = await _connectClient();
+  if (ok) await _refreshModelStatus();
   _updateLoadButtonState();
   syncUI();
 }
@@ -478,8 +525,16 @@ function _updateLoadButtonState() {
   const btn = document.getElementById('load-btn');
   if (!btn) return;
   if (!client) {
-    btn.disabled = true;
-    btn.textContent = 'CONNECTING…';
+    if (isConnecting) {
+      btn.disabled = true;
+      btn.textContent = 'CONNECTING…';
+    } else {
+      // Auto-retries exhausted (or not started yet) — let the user
+      // manually kick off a (re)connect attempt instead of being stuck
+      // behind a permanently disabled button with no way out.
+      btn.disabled = false;
+      btn.textContent = 'RETRY CONNECT';
+    }
     return;
   }
   if (isRestarting) {
@@ -596,10 +651,22 @@ async function _waitForServerAndReload() {
 }
 
 async function loadModel() {
-  if (!client || isRestarting || isLoadingModel) {
-    if (!client) showToast('Клиент ещё подключается к серверу — подождите пару секунд');
-    return;
+  if (isRestarting || isLoadingModel || isConnecting) return;
+
+  if (!client) {
+    // Either still-connecting retries were exhausted (button shows "RETRY
+    // CONNECT") or this is the very first click before boot() finished —
+    // either way, (re)connect right now instead of leaving the user stuck.
+    const ok = await _connectClient();
+    if (!ok) return; // status/button already reflect the failure
+    await _refreshModelStatus();
+    _updateLoadButtonState();
+    syncUI();
+    // If what's already loaded server-side matches the current selection,
+    // we're done — no need to also fire off a redundant load_model call.
+    if (modelReady && loadedVariant === _currentVariant()) return;
   }
+
   const variant = _currentVariant();
   isLoadingModel = true;
   modelReady     = false;
@@ -628,6 +695,7 @@ async function loadModel() {
       if (msg.type === 'status' && msg.stage === 'complete') break;
     }
   } catch (e) {
+    console.error('[unlimited-ocr] /load_model failed:', e);
     setStatus('error', 'LOAD ERROR · ' + e.message);
   } finally {
     if (!isRestarting) {
