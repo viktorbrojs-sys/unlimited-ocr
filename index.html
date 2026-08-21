@@ -239,7 +239,7 @@
   <header>
     <div class="logo-area">
       <div class="logo-icon">📄</div>
-      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.1</span></span>
+      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.2</span></span>
     </div>
     <div class="header-sep"></div>
 
@@ -272,11 +272,11 @@
 
     <div class="ngram-group" id="precision-wrap">
       <span class="ngram-label">MODEL</span>
-      <select id="model-select" class="model-select">
+      <select id="model-select" class="model-select" onchange="_updateLoadButtonState()">
         <option value="bf16" selected>bf16 · ~7 GB VRAM (full precision)</option>
       </select>
     </div>
-    <button class="btn" id="load-btn" onclick="loadModel()">LOAD</button>
+    <button class="btn" id="load-btn" onclick="loadModel()" disabled>CONNECTING…</button>
 
     <div class="header-actions">
       <button class="btn btn-clear" onclick="clearAll()">
@@ -408,13 +408,17 @@ let currentFile   = null;
 let isPDF         = false;
 let isRunning     = false;
 let isRestarting  = false;
+let isLoadingModel = false;
 let stopRequested = false;
 let charCount     = 0;
 let zoomedOut     = false;
 let modelReady    = false;
+let loadedVariant = null; // 'bf16' | 'cpu' | null — what's actually loaded server-side
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
+  _updateLoadButtonState(); // shows "CONNECTING…" immediately, before anything async
+
   // If we just came back from a CPU-mode server restart, restore the
   // device selection so the user doesn't have to click CPU again.
   const params = new URLSearchParams(window.location.search);
@@ -431,6 +435,7 @@ async function boot() {
     const st   = res?.data?.[0] ?? {};
     if (st.loaded) {
       modelReady = true;
+      loadedVariant = _variantFromLabel(st.label);
       setStatus('idle', 'READY · ' + (st.label ?? 'model'));
     } else {
       setStatus('idle', 'MODEL NOT LOADED · pick a device/model and press LOAD');
@@ -438,6 +443,7 @@ async function boot() {
   } catch (e) {
     setStatus('error', 'CONNECTION ERROR · ' + e.message);
   }
+  _updateLoadButtonState();
   syncUI();
 }
 boot();
@@ -447,12 +453,62 @@ function syncUI() {
   document.getElementById('start-btn').disabled = !(currentFile && modelReady);
 }
 
+// Maps the human-readable label the backend reports (model_status/load_model)
+// back to the short variant id used by the UI, so we can tell whether the
+// model that's actually loaded server-side matches what's currently
+// selected in the DEVICE/MODEL controls.
+function _variantFromLabel(label) {
+  if (!label) return null;
+  if (label.startsWith('CUDA bf16')) return 'bf16';
+  if (label.startsWith('CPU')) return 'cpu';
+  return null;
+}
+
+function _currentVariant() {
+  return currentDevice === 'cpu' ? 'cpu' : document.getElementById('model-select').value;
+}
+
+// Single source of truth for the LOAD button's label/enabled state, called
+// after every event that could change it (connect, device/model change,
+// load start/end, restart start/end, OOM unload). Without this the button
+// could be clicked before the client finished connecting ("Client not
+// ready yet" with no clue why), or stay looking clickable after the model
+// was already loaded, or after a server restart wiped out the connection.
+function _updateLoadButtonState() {
+  const btn = document.getElementById('load-btn');
+  if (!btn) return;
+  if (!client) {
+    btn.disabled = true;
+    btn.textContent = 'CONNECTING…';
+    return;
+  }
+  if (isRestarting) {
+    btn.disabled = true;
+    btn.textContent = 'RESTARTING…';
+    return;
+  }
+  if (isLoadingModel) {
+    btn.disabled = true;
+    btn.textContent = 'LOADING…';
+    return;
+  }
+  if (modelReady && loadedVariant === _currentVariant()) {
+    btn.disabled = true;
+    btn.textContent = '✓ LOADED';
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = 'LOAD';
+}
+window._updateLoadButtonState = _updateLoadButtonState;
+
 window.setDevice = (d) => {
   currentDevice = d;
   document.getElementById('btn-device-gpu').classList.toggle('active', d === 'gpu');
   document.getElementById('btn-device-cpu').classList.toggle('active', d === 'cpu');
   // Precision only matters for GPU — CPU only ever runs float32.
   document.getElementById('precision-wrap').style.display = d === 'gpu' ? 'flex' : 'none';
+  _updateLoadButtonState();
 };
 
 // run_ocr() prefixes its message with "VRAM_OOM:" when it had to unload the
@@ -469,8 +525,8 @@ function _isOomUnloadError(message) {
 // load itself; the user still has to press LOAD.
 function _handleOomUnload(rawMessage) {
   modelReady = false;
-  setDevice('cpu');
-  document.getElementById('load-btn').disabled = false;
+  loadedVariant = null;
+  setDevice('cpu'); // also calls _updateLoadButtonState()
   setStatus('error', 'МОДЕЛЬ ВЫГРУЖЕНА (не хватило VRAM) · переключитесь на CPU и нажмите LOAD');
   syncUI();
   return rawMessage.replace(/^VRAM_OOM:\s*/, '');
@@ -482,11 +538,13 @@ async function _pollModelStatus() {
     const st  = res?.data?.[0] ?? {};
     if (st.loaded && !modelReady) {
       modelReady = true;
+      loadedVariant = _variantFromLabel(st.label);
       setStatus('idle', 'READY · ' + (st.label ?? 'model'));
       showToast('Model loaded');
       syncUI();
     }
   } catch (_) { /* ignore polling errors */ }
+  _updateLoadButtonState();
 }
 
 // After the server restarts itself for CPU mode (os.execve — the whole
@@ -496,7 +554,7 @@ async function _pollModelStatus() {
 // to wait or refresh.
 async function _waitForServerAndReload() {
   isRestarting = true;
-  document.getElementById('load-btn').disabled = true;
+  _updateLoadButtonState();
   showNotification('Сервер перезапускается для переключения в CPU-режим — страница обновится автоматически, подождите…');
 
   let elapsed = 0;
@@ -526,7 +584,7 @@ async function _waitForServerAndReload() {
     if (attempts >= maxAttempts) {
       clearInterval(tick);
       isRestarting = false;
-      document.getElementById('load-btn').disabled = false;
+      _updateLoadButtonState();
       setStatus('error', 'НЕ УДАЁТСЯ ПЕРЕПОДКЛЮЧИТЬСЯ · обновите страницу вручную');
       return;
     }
@@ -538,12 +596,16 @@ async function _waitForServerAndReload() {
 }
 
 async function loadModel() {
-  if (!client || isRestarting) { if (!client) showToast('Client not ready yet'); return; }
-  const btn     = document.getElementById('load-btn');
-  const variant = currentDevice === 'cpu' ? 'cpu' : document.getElementById('model-select').value;
-  btn.disabled  = true;
-  modelReady    = false;
+  if (!client || isRestarting || isLoadingModel) {
+    if (!client) showToast('Клиент ещё подключается к серверу — подождите пару секунд');
+    return;
+  }
+  const variant = _currentVariant();
+  isLoadingModel = true;
+  modelReady     = false;
+  loadedVariant  = null;
   hideNotification(); // Clear any previous notifications
+  _updateLoadButtonState();
   syncUI();
   setStatus('running', 'LOADING MODEL · ' + variant.toUpperCase());
   try {
@@ -552,12 +614,14 @@ async function loadModel() {
       if (msg.type === 'data') {
         const d = msg.data?.[0] ?? {};
         if (d.stage && d.stage.startsWith('Restarting server')) {
+          isLoadingModel = false;
           _waitForServerAndReload();
           return; // stop driving this load attempt — the reconnect flow takes over
         }
         if (d.stage) setStatus(d.ready ? 'idle' : 'running', d.stage.toUpperCase());
         if (d.ready) {
           modelReady = true;
+          loadedVariant = _variantFromLabel(d.label);
           showToast('Model loaded');
         }
       }
@@ -567,9 +631,10 @@ async function loadModel() {
     setStatus('error', 'LOAD ERROR · ' + e.message);
   } finally {
     if (!isRestarting) {
-      btn.disabled = false;
+      isLoadingModel = false;
       // Safety-net: if SSE dropped or format mismatched, poll actual model state.
       if (!modelReady) await _pollModelStatus();
+      _updateLoadButtonState();
       syncUI();
     }
   }

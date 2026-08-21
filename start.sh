@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║     Unlimited OCR - Start Script v1.2.1               ║${NC}"
+echo -e "${BLUE}║              Unlimited OCR - Start Script               ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -31,11 +31,6 @@ get_version() {
         echo "unknown"
     fi
 }
-
-# Display current version
-CURRENT_VERSION=$(get_version)
-echo -e "${GREEN}Current version:${NC} $CURRENT_VERSION"
-echo ""
 
 # Check if we're in a git repository
 if [ ! -d ".git" ]; then
@@ -58,6 +53,12 @@ if ! git diff --quiet HEAD@{u} 2>/dev/null; then
 else
     echo -e "${GREEN}✓ Repository is up to date${NC}"
 fi
+echo ""
+
+# Read the version AFTER pulling — reading it earlier (before the update)
+# would always show the *previous* run's version, one commit behind.
+CURRENT_VERSION=$(get_version)
+echo -e "${GREEN}Version:${NC} $CURRENT_VERSION"
 echo ""
 
 # Step 2: Create/activate virtual environment
