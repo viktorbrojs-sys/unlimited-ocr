@@ -495,7 +495,13 @@ def run_ocr(
         _infer_lock.release()
 
     if oom["hit"]:
+        # The "VRAM_OOM:" prefix is a stable machine-readable marker for the
+        # frontend to detect this specific case (vs. any other error) and
+        # react in the UI — nudge the device toggle to CPU, mark the model
+        # as not-ready, etc. — without having to pattern-match the Russian
+        # prose that follows. Frontend strips the prefix before display.
         raise RuntimeError(
+            "VRAM_OOM: "
             "Не хватило видеопамяти (VRAM) во время обработки этого "
             "изображения. Модель выгружена из GPU, чтобы освободить "
             "память — переключите вариант на CPU в шапке страницы и "

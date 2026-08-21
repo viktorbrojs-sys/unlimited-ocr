@@ -239,7 +239,7 @@
   <header>
     <div class="logo-area">
       <div class="logo-icon">📄</div>
-      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.0</span></span>
+      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.1</span></span>
     </div>
     <div class="header-sep"></div>
 
@@ -454,6 +454,27 @@ window.setDevice = (d) => {
   // Precision only matters for GPU — CPU only ever runs float32.
   document.getElementById('precision-wrap').style.display = d === 'gpu' ? 'flex' : 'none';
 };
+
+// run_ocr() prefixes its message with "VRAM_OOM:" when it had to unload the
+// model from the GPU after a CUDA OOM mid-inference (see app.py). This is a
+// stable marker to detect that specific case in the UI.
+function _isOomUnloadError(message) {
+  return typeof message === 'string' && message.startsWith('VRAM_OOM:');
+}
+
+// The backend already unloaded the model — reflect that here instead of
+// leaving the UI claiming "READY" for a model that no longer exists
+// server-side. We only *suggest* CPU by flipping the toggle (a visible,
+// undoable UI nudge, matching the error text) — we never auto-trigger the
+// load itself; the user still has to press LOAD.
+function _handleOomUnload(rawMessage) {
+  modelReady = false;
+  setDevice('cpu');
+  document.getElementById('load-btn').disabled = false;
+  setStatus('error', 'МОДЕЛЬ ВЫГРУЖЕНА (не хватило VRAM) · переключитесь на CPU и нажмите LOAD');
+  syncUI();
+  return rawMessage.replace(/^VRAM_OOM:\s*/, '');
+}
 
 async function _pollModelStatus() {
   try {
@@ -703,7 +724,8 @@ async function runSingleImage(ocrDiv, prompt, mode, ngramGuard) {
     finishDone(finalText);
   } catch (err) {
     if (stopRequested) return finishStop(ocrDiv);
-    showError(ocrDiv, err.message);
+    const msg = _isOomUnloadError(err.message) ? _handleOomUnload(err.message) : err.message;
+    showError(ocrDiv, msg);
   }
 }
 
@@ -786,6 +808,12 @@ async function runPDF(ocrDiv, prompt, mode, ngramGuard) {
       if (!pageText) slot.textContent = '(no text detected)';
     } catch (err) {
       if (stopRequested) return finishStop(ocrDiv);
+      if (_isOomUnloadError(err.message)) {
+        const msg = _handleOomUnload(err.message);
+        slot.innerHTML = `<span style="color:var(--red)">Страница ${i + 1}: ${msg}</span>`;
+        document.getElementById('output-tag').textContent = 'ERROR';
+        return; // модель выгружена — дальнейшие страницы всё равно упадут
+      }
       slot.innerHTML = `<span style="color:var(--red)">Page ${i + 1} error: ${err.message}</span>`;
     }
   }
