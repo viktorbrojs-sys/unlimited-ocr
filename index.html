@@ -239,13 +239,15 @@
   <header>
     <div class="logo-area">
       <div class="logo-icon">📄</div>
-      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.2.3</span></span>
+      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.0</span></span>
     </div>
     <div class="header-sep"></div>
 
     <div class="mode-group" role="group" aria-label="Inference mode">
-      <button class="mode-btn active" id="btn-long" onclick="setMode('long')">Long · 640px</button>
-      <button class="mode-btn"        id="btn-base" onclick="setMode('base')">Base · 1024px</button>
+      <button class="mode-btn active" id="btn-long" onclick="setMode('long')"
+              title="LONG: изображение режется на тайлы 640px. Быстрее, лучше подходит для длинных/многостраничных документов, где важна скорость, а не мелкий шрифт в одном месте.">Long · 640px</button>
+      <button class="mode-btn"        id="btn-base" onclick="setMode('base')"
+              title="BASE: страница целиком в разрешении 1024px без нарезки на тайлы. Точнее для мелкого/плотного текста на одной странице, но медленнее и хуже масштабируется на очень длинные документы.">Base · 1024px</button>
     </div>
     <div class="header-sep"></div>
     <div class="ngram-group">
@@ -258,15 +260,23 @@
 
     <div class="header-sep"></div>
 
-    <div class="ngram-group">
+    <div class="ngram-group" id="device-group">
+      <span class="ngram-label">DEVICE</span>
+      <div class="mode-group" role="group" aria-label="Compute device" style="padding:2px;">
+        <button class="mode-btn active" id="btn-device-gpu" onclick="setDevice('gpu')">GPU</button>
+        <button class="mode-btn"        id="btn-device-cpu" onclick="setDevice('cpu')">CPU</button>
+      </div>
+    </div>
+
+    <div class="header-sep"></div>
+
+    <div class="ngram-group" id="precision-wrap">
       <span class="ngram-label">MODEL</span>
       <select id="model-select" class="model-select">
-        <option value="auto" selected>auto (bf16 → CPU)</option>
-        <option value="bf16">bf16 · ~7 GB VRAM (full precision)</option>
-        <option value="cpu">CPU · slow but works</option>
+        <option value="bf16" selected>bf16 · ~7 GB VRAM (full precision)</option>
       </select>
-      <button class="btn" id="load-btn" onclick="loadModel()">LOAD</button>
     </div>
+    <button class="btn" id="load-btn" onclick="loadModel()">LOAD</button>
 
     <div class="header-actions">
       <button class="btn btn-clear" onclick="clearAll()">
@@ -393,9 +403,11 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 // ── State ─────────────────────────────────────────────────────────────────────
 let client        = null;
 let currentMode   = 'long';
+let currentDevice = 'gpu';
 let currentFile   = null;
 let isPDF         = false;
 let isRunning     = false;
+let isRestarting  = false;
 let stopRequested = false;
 let charCount     = 0;
 let zoomedOut     = false;
@@ -403,6 +415,16 @@ let modelReady    = false;
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
+  // If we just came back from a CPU-mode server restart, restore the
+  // device selection so the user doesn't have to click CPU again.
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('device') === 'cpu') {
+    setDevice('cpu');
+    params.delete('device');
+    const cleanUrl = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+    window.history.replaceState({}, '', cleanUrl);
+  }
+
   try {
     client = await Client.connect(window.location.origin);
     const res  = await client.predict('/model_status', {});
@@ -411,7 +433,7 @@ async function boot() {
       modelReady = true;
       setStatus('idle', 'READY · ' + (st.label ?? 'model'));
     } else {
-      setStatus('idle', 'MODEL NOT LOADED · pick a variant and press LOAD');
+      setStatus('idle', 'MODEL NOT LOADED · pick a device/model and press LOAD');
     }
   } catch (e) {
     setStatus('error', 'CONNECTION ERROR · ' + e.message);
@@ -420,10 +442,18 @@ async function boot() {
 }
 boot();
 
-// ── Model loading (variant picker in the header) ─────────────────────────────
+// ── Model loading (device + precision picker in the header) ─────────────────
 function syncUI() {
   document.getElementById('start-btn').disabled = !(currentFile && modelReady);
 }
+
+window.setDevice = (d) => {
+  currentDevice = d;
+  document.getElementById('btn-device-gpu').classList.toggle('active', d === 'gpu');
+  document.getElementById('btn-device-cpu').classList.toggle('active', d === 'cpu');
+  // Precision only matters for GPU — CPU only ever runs float32.
+  document.getElementById('precision-wrap').style.display = d === 'gpu' ? 'flex' : 'none';
+};
 
 async function _pollModelStatus() {
   try {
@@ -433,22 +463,63 @@ async function _pollModelStatus() {
       modelReady = true;
       setStatus('idle', 'READY · ' + (st.label ?? 'model'));
       showToast('Model loaded');
-      // Show notification if CPU fallback occurred
-      if (st.notification) {
-        showNotification(st.notification);
-      }
       syncUI();
-    } else if (st.loaded && st.notification) {
-      // Model already loaded, but show notification if present
-      showNotification(st.notification);
     }
   } catch (_) { /* ignore polling errors */ }
 }
 
+// After the server restarts itself for CPU mode (os.execve — the whole
+// process, and every open connection, goes away for a few seconds), poll
+// until it's back up, then reload the page. Without this, a normal user
+// is just staring at a frozen "restarting…" message with no idea whether
+// to wait or refresh.
+async function _waitForServerAndReload() {
+  isRestarting = true;
+  document.getElementById('load-btn').disabled = true;
+  showNotification('Сервер перезапускается для переключения в CPU-режим — страница обновится автоматически, подождите…');
+
+  let elapsed = 0;
+  let attempts = 0;
+  const maxAttempts = 40; // ~ a bit over a minute of polling at 1.5s intervals
+
+  const tick = setInterval(() => {
+    elapsed += 1;
+    setStatus('running', `RESTARTING SERVER (CPU MODE) · ${elapsed}s`);
+  }, 1000);
+
+  const tryOnce = async () => {
+    attempts += 1;
+    try {
+      const res = await fetch(window.location.origin + '/', { cache: 'no-store' });
+      if (res.ok) {
+        clearInterval(tick);
+        setStatus('done', 'СЕРВЕР СНОВА НА СВЯЗИ · ОБНОВЛЯЕМ СТРАНИЦУ…');
+        setTimeout(() => {
+          const url = new URL(window.location.href);
+          url.searchParams.set('device', 'cpu');
+          window.location.href = url.toString();
+        }, 400);
+        return;
+      }
+    } catch (_) { /* server still down — keep polling */ }
+    if (attempts >= maxAttempts) {
+      clearInterval(tick);
+      isRestarting = false;
+      document.getElementById('load-btn').disabled = false;
+      setStatus('error', 'НЕ УДАЁТСЯ ПЕРЕПОДКЛЮЧИТЬСЯ · обновите страницу вручную');
+      return;
+    }
+    setTimeout(tryOnce, 1500);
+  };
+  // Give the process a moment before the first attempt — it has to fully
+  // exit and re-import torch/transformers before it can answer again.
+  setTimeout(tryOnce, 1500);
+}
+
 async function loadModel() {
-  if (!client) { showToast('Client not ready yet'); return; }
+  if (!client || isRestarting) { if (!client) showToast('Client not ready yet'); return; }
   const btn     = document.getElementById('load-btn');
-  const variant = document.getElementById('model-select').value;
+  const variant = currentDevice === 'cpu' ? 'cpu' : document.getElementById('model-select').value;
   btn.disabled  = true;
   modelReady    = false;
   hideNotification(); // Clear any previous notifications
@@ -459,14 +530,14 @@ async function loadModel() {
     for await (const msg of sub) {
       if (msg.type === 'data') {
         const d = msg.data?.[0] ?? {};
+        if (d.stage && d.stage.startsWith('Restarting server')) {
+          _waitForServerAndReload();
+          return; // stop driving this load attempt — the reconnect flow takes over
+        }
         if (d.stage) setStatus(d.ready ? 'idle' : 'running', d.stage.toUpperCase());
-        if (d.ready) { 
-          modelReady = true; 
+        if (d.ready) {
+          modelReady = true;
           showToast('Model loaded');
-          // Check for notification in the final response
-          if (d.notification) {
-            showNotification(d.notification);
-          }
         }
       }
       if (msg.type === 'status' && msg.stage === 'complete') break;
@@ -474,10 +545,12 @@ async function loadModel() {
   } catch (e) {
     setStatus('error', 'LOAD ERROR · ' + e.message);
   } finally {
-    btn.disabled = false;
-    // Safety-net: if SSE dropped or format mismatched, poll actual model state.
-    if (!modelReady) await _pollModelStatus();
-    syncUI();
+    if (!isRestarting) {
+      btn.disabled = false;
+      // Safety-net: if SSE dropped or format mismatched, poll actual model state.
+      if (!modelReady) await _pollModelStatus();
+      syncUI();
+    }
   }
 }
 window.loadModel = loadModel;
@@ -569,7 +642,7 @@ async function loadFile(file) {
 async function startOCR() {
   if (!currentFile || isRunning) return;
   if (!client) { showToast('Client not ready yet'); return; }
-  if (!modelReady) { showToast('Model not loaded — pick a variant and press LOAD'); return; }
+  if (!modelReady) { showToast('Model not loaded — pick a device/model and press LOAD'); return; }
 
   isRunning     = true;
   stopRequested = false;
@@ -583,6 +656,7 @@ async function startOCR() {
   setProgressIndeterminate(true);
 
   const prompt = document.getElementById('prompt-input').value || 'document parsing.';
+  const ngramGuard = document.getElementById('ngram-toggle').checked;
   // Long mode → gundam (640px crop, fast, ZeroGPU-friendly)
   // Base mode → base (1024px, more accurate)
   const mode   = currentMode === 'long' ? 'gundam' : 'base';
@@ -590,9 +664,9 @@ async function startOCR() {
 
   try {
     if (isPDF) {
-      await runPDF(ocrDiv, prompt, mode);
+      await runPDF(ocrDiv, prompt, mode, ngramGuard);
     } else {
-      await runSingleImage(ocrDiv, prompt, mode);
+      await runSingleImage(ocrDiv, prompt, mode, ngramGuard);
     }
   } finally {
     isRunning = false;
@@ -603,7 +677,7 @@ async function startOCR() {
 }
 
 // ── Single image — streaming via client.submit() ────────────────────────────
-async function runSingleImage(ocrDiv, prompt, mode) {
+async function runSingleImage(ocrDiv, prompt, mode, ngramGuard) {
   ocrDiv.innerHTML = '<span class="cursor"></span>';
   setStatus('running', 'IN GPU QUEUE…');
 
@@ -611,6 +685,7 @@ async function runSingleImage(ocrDiv, prompt, mode) {
     image_path: handle_file(currentFile),
     mode,
     prompt,
+    ngram_guard: ngramGuard,
   });
 
   let finalText = '';
@@ -639,7 +714,7 @@ async function runSingleImage(ocrDiv, prompt, mode) {
 //   • One page/call = multiple users can be served concurrently
 //   • PDF extraction is CPU-only (no GPU wasted on I/O)
 //
-async function runPDF(ocrDiv, prompt, mode) {
+async function runPDF(ocrDiv, prompt, mode, ngramGuard) {
   setStatus('running', 'EXTRACTING PDF PAGES (CPU)…');
   ocrDiv.innerHTML = '<span class="cursor"></span>';
 
@@ -689,6 +764,7 @@ async function runPDF(ocrDiv, prompt, mode) {
       image_path: { path: pages[i].path, orig_name: pages[i].orig_name },
       mode,
       prompt,
+      ngram_guard: ngramGuard,
     });
     try {
       let pageText = '';

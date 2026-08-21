@@ -54,7 +54,6 @@ _infer_lock = threading.Lock()
 _model_state_lock = threading.Lock()  # Protects model / tokenizer / _model_label
 _temp_dirs: list[str] = []
 _temp_dirs_lock = threading.Lock()  # Protect _temp_dirs from concurrent access
-_cpu_fallback_triggered = False  # Flag to track if CPU fallback was triggered
 
 
 def _cleanup() -> None:
@@ -95,16 +94,21 @@ _MODEL_VARIANTS: dict[str, str] = {
 
 def _variant_kwargs(name: str) -> tuple[dict, str | None]:
     """from_pretrained kwargs and .to() target for a variant label."""
-    global _cpu_fallback_triggered
     if name == "CUDA bf16 (full precision)":
         return dict(dtype=torch.bfloat16), "cuda"
     # For CPU mode, explicitly ensure no CUDA device is used
-    _cpu_fallback_triggered = True
     return dict(dtype=torch.float32, device_map="cpu"), "cpu"
 
 
 def _load_model_sync(variant: str, q) -> None:
-    """Load the requested variant; push ("stage"|"done"|"error", text) into q.
+    """Load the requested variant; push ("stage"|"done", text) into q, or
+    raise on failure (caller turns that into an "error" queue item).
+
+    No hidden auto-fallback here: the caller (UI) picks device + precision
+    explicitly, and if that exact choice fails to load, we say so plainly
+    rather than silently switching to something else. The only exception is
+    hardware, not choice: if there is no CUDA device at all, CPU is used
+    regardless of what was requested, since there's nothing else to try.
 
     The model's own infer() code sends inputs to cuda whenever
     torch.cuda.is_available(), so a CPU-resident model next to a visible GPU
@@ -112,7 +116,7 @@ def _load_model_sync(variant: str, q) -> None:
     requires CUDA to be hidden — we signal this via a magic exit code so the
     caller can re-exec the whole process with CUDA_VISIBLE_DEVICES="".
     """
-    global tokenizer, model, _model_label, _cpu_fallback_triggered
+    global tokenizer, model, _model_label
     with _model_state_lock:
         if model is not None:
             q.put(("stage", "Unloading current model..."))
@@ -126,104 +130,78 @@ def _load_model_sync(variant: str, q) -> None:
             q.put(("stage", "Loading tokenizer..."))
             tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
-    # Reset CPU fallback flag
-    _cpu_fallback_triggered = False
-
     if not torch.cuda.is_available():
-        names = ["CPU float32 (slow)"]
-    elif variant == "auto":
-        # Try CUDA bf16 first, then CPU
-        names = ["CUDA bf16 (full precision)", "CPU float32 (slow)"]
+        if variant != "cpu":
+            q.put(("stage", "No CUDA GPU detected — using CPU regardless of the selected precision."))
+        name = "CPU float32 (slow)"
     else:
-        names = [_MODEL_VARIANTS.get(variant, variant)]
+        name = _MODEL_VARIANTS.get(variant, variant)
 
-    last_err: Exception | None = None
-    for name in names:
-        # CPU next to visible CUDA is impossible — signal caller to re-exec.
-        if "CPU" in name and torch.cuda.is_available():
-            q.put(("stage", "CPU mode requires hiding CUDA — the server will auto-restart..."))
-            q.put(("cpu_restart", ""))
-            return
-        try:
-            q.put(("stage", f"Loading model: {name}..."))
-            kwargs, move_to = _variant_kwargs(name)
-            m = AutoModel.from_pretrained(
-                MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
-            )
-            m = m.eval().to(move_to) if move_to else m.eval()
-            with _model_state_lock:
-                model = m
-                _model_label = name
-            q.put(("done", name))
-            return
-        except RuntimeError as e:
-            # Check if this is a CUDA OOM error - if so, try CPU fallback
-            error_str = str(e).lower()
-            if "cuda" in error_str and ("out of memory" in error_str or "oom" in error_str):
-                last_err = e
-                q.put(("stage", f"{name} failed: CUDA OOM - switching to CPU mode"))
-                with _model_state_lock:
-                    model = None
-                m = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                # Continue to next variant (CPU)
-                continue
-            else:
-                last_err = e
-                q.put(("stage", f"{name} failed: {e}"))
-                with _model_state_lock:
-                    model = None
-                m = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        except Exception as e:
-            last_err = e
-            q.put(("stage", f"{name} failed: {e}"))
-            with _model_state_lock:
-                model = None
-            m = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    # CPU next to visible CUDA is impossible — signal caller to re-exec.
+    if "CPU" in name and torch.cuda.is_available():
+        q.put(("stage", "CPU mode requires hiding CUDA — the server will auto-restart..."))
+        q.put(("cpu_restart", ""))
+        return
 
-    # If we get here, all variants failed
-    raise RuntimeError(
-        "Could not load the model. "
-        f"(last error: {last_err})"
-    )
+    try:
+        q.put(("stage", f"Loading model: {name}..."))
+        kwargs, move_to = _variant_kwargs(name)
+        m = AutoModel.from_pretrained(
+            MODEL_NAME, trust_remote_code=True, use_safetensors=True, **kwargs
+        )
+        m = m.eval().to(move_to) if move_to else m.eval()
+        with _model_state_lock:
+            model = m
+            _model_label = name
+        q.put(("done", name))
+    except RuntimeError as e:
+        with _model_state_lock:
+            model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        error_str = str(e).lower()
+        if "cuda" in error_str and ("out of memory" in error_str or "oom" in error_str):
+            raise RuntimeError(
+                f"{name}: not enough GPU memory to load this model "
+                f"(CUDA out of memory). Switch to CPU and press LOAD, or "
+                f"free up VRAM and try again. Original error: {e}"
+            ) from e
+        raise RuntimeError(f"Could not load {name}: {e}") from e
+    except Exception as e:
+        with _model_state_lock:
+            model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise RuntimeError(f"Could not load {name}: {e}") from e
 
 
-def _target_labels(variant: str) -> list[str]:
-    """Resolve variant name to the list of model labels it would try."""
+def _target_label(variant: str) -> str:
+    """Resolve variant name to the model label it would load."""
     if not torch.cuda.is_available():
-        return ["CPU float32 (slow)"]
-    if variant == "auto":
-        return ["CUDA bf16 (full precision)", "CPU float32 (slow)"]
-    return [_MODEL_VARIANTS.get(variant, variant)]
+        return "CPU float32 (slow)"
+    return _MODEL_VARIANTS.get(variant, variant)
 
 
 @app.api(stream_every=0.5)
-def load_model(variant: str = "auto") -> Iterator[dict]:
+def load_model(variant: str = "cpu") -> Iterator[dict]:
     """
-    Load (or switch) the model on demand. Streams progress dicts:
+    Load (or switch) the model with the exact variant requested — no hidden
+    auto-fallback. Streams progress dicts:
     {"stage": str, "ready": bool, "label": str | None}
 
-    For "cpu" / "auto falling back to CPU": the server auto-restarts itself
-    with CUDA hidden so the model's infer() doesn't send tensors to a wrong device.
-
-    Notifies user when switching to CPU mode due to CUDA OOM.
+    For "cpu": the server auto-restarts itself with CUDA hidden so the
+    model's infer() doesn't send tensors to a wrong device.
     """
-    if variant != "auto" and variant not in _MODEL_VARIANTS:
+    if variant not in _MODEL_VARIANTS:
         yield {"stage": f"Unknown variant: {variant}", "ready": False, "label": None}
         return
 
     # Skip reload if the model is already loaded with the requested variant.
     with _model_state_lock:
         current_label = _model_label
-    if current_label in _target_labels(variant):
+    if current_label == _target_label(variant):
         yield {"stage": f"Model already loaded: {current_label}", "ready": True, "label": current_label}
         return
 
@@ -255,27 +233,9 @@ def load_model(variant: str = "auto") -> Iterator[dict]:
                 break
             kind, msg = item
             if kind == "stage":
-                # Check if this is a CPU fallback notification
-                if "switching to CPU mode" in msg or "CUDA OOM" in msg:
-                    yield {
-                        "stage": f"⚠️ {msg}",
-                        "ready": False,
-                        "label": None,
-                        "notification": "GPU memory insufficient - automatically switching to CPU mode. Performance will be slower."
-                    }
-                else:
-                    yield {"stage": msg, "ready": False, "label": None}
+                yield {"stage": msg, "ready": False, "label": None}
             elif kind == "done":
-                # Check if we ended up on CPU after fallback
-                if _cpu_fallback_triggered:
-                    yield {
-                        "stage": f"Model ready: {msg} (CPU fallback activated)",
-                        "ready": True,
-                        "label": msg,
-                        "notification": "Running on CPU due to insufficient GPU memory. Consider using a smaller model or reducing batch size."
-                    }
-                else:
-                    yield {"stage": f"Model ready: {msg}", "ready": True, "label": msg}
+                yield {"stage": f"Model ready: {msg}", "ready": True, "label": msg}
                 return
             elif kind == "cpu_restart":
                 yield {"stage": "Restarting server in CPU mode...", "ready": False, "label": None}
@@ -297,7 +257,7 @@ def model_status() -> dict:
 
 
 # ── PDF helper — CPU only ─────────────────────────────────────────────────────
-def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
+def pdf_to_images(pdf_path: str, dpi: int = 300) -> list[str]:
     """Convert every page of a PDF to a PNG. Returns list of file paths."""
     import fitz
     doc = fitz.open(pdf_path)
@@ -390,6 +350,7 @@ def run_ocr(
     image_path: FileData,
     mode: str = "gundam",
     prompt: str = "document parsing.",
+    ngram_guard: bool = True,
 ) -> Iterator[dict]:
     """
     Stream OCR output for one image page token-by-token.
@@ -398,11 +359,17 @@ def run_ocr(
 
     mode: 'gundam' — fast (640 px crop)
           'base'   — accurate (1024 px)
+    ngram_guard: if True (default), forbids the model from repeating the
+        same 35-token sequence back to back (no_repeat_ngram_size) — guards
+        against degenerate repetition loops on long/hard documents. Disable
+        for documents with legitimate long repeated sequences (e.g. tables,
+        repeated boilerplate) where the guard could suppress correct output.
     """
+    global model, _model_label
     with _model_state_lock:
         current_model = model
     if current_model is None:
-        yield {"text": "Model is not loaded — pick a variant and press LOAD in the header.", "done": True}
+        yield {"text": "Model is not loaded — pick a device/model and press LOAD in the header.", "done": True}
         return
 
     # Hold the inference lock for the whole request (not just inside the
@@ -431,13 +398,15 @@ def run_ocr(
             image_size=image_size,
             crop_mode=crop_mode,
             max_length=8192,
-            no_repeat_ngram_size=35,
+            no_repeat_ngram_size=(35 if ngram_guard else 0),
             ngram_window=ngram_window,
             save_results=True,
         )
 
         q = queue.Queue()
         errors = []
+        oom = {"hit": False}
+
         def _infer_thread():
             # _infer_lock is already held by the outer generator (see above) —
             # do not re-acquire it here, this thread just does the actual work.
@@ -458,6 +427,11 @@ def run_ocr(
                         torch.bfloat16 = _orig_bfloat16
                 else:
                     current_model.infer(tokenizer, **_infer_kwargs)
+            except RuntimeError as e:
+                error_str = str(e).lower()
+                if "cuda" in error_str and ("out of memory" in error_str or "oom" in error_str):
+                    oom["hit"] = True
+                errors.append(str(e))
             except Exception as e:
                 errors.append(str(e))
         thread = Thread(target=_infer_thread, daemon=True)
@@ -481,12 +455,30 @@ def run_ocr(
             sys.stdout = original_stdout
             thread.join()
 
-        # ── Fallback/Final: read file to get clean text ───────────────────────
-        full_text = _collect_output(out_dir)
+        if oom["hit"]:
+            # Not enough VRAM mid-inference (as opposed to at load time —
+            # that path is handled separately in _load_model_sync). The
+            # model object is still technically "loaded" but its CUDA state
+            # may be unreliable after an OOM, and it's holding VRAM we want
+            # back — unload it explicitly instead of leaving a wounded
+            # model sitting on the GPU. This is a deliberate, visible action
+            # reported to the user, not a silent auto-switch to CPU: they
+            # still have to pick CPU and press LOAD themselves.
+            with _model_state_lock:
+                model = None
+                _model_label = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            full_text = ""
+        else:
+            # ── Fallback/Final: read file to get clean text ───────────────
+            full_text = _collect_output(out_dir)
     finally:
         # Release the lock as soon as the model is actually done with this
-        # request (inference thread joined, result file already read) —
-        # do NOT wait for this generator to reach its own natural end.
+        # request (inference thread joined, result file already read, and
+        # any OOM cleanup done) — do NOT wait for this generator to reach
+        # its own natural end.
         #
         # Why: everything below is just replaying already-collected text to
         # the client for the UI (no model/GPU access anymore). If we kept
@@ -502,14 +494,31 @@ def run_ocr(
         # Releasing here removes that dependency entirely.
         _infer_lock.release()
 
-    if full_text:
-        # Stream the final result character by character (matches the
-        # reference Baidu Space's typewriter-style output) instead of in
-        # 5-word chunks.
-        acc = ""
-        for i, ch in enumerate(full_text):
-            acc += ch
-            yield {"text": acc, "done": i == len(full_text) - 1}
+    if oom["hit"]:
+        raise RuntimeError(
+            "Не хватило видеопамяти (VRAM) во время обработки этого "
+            "изображения. Модель выгружена из GPU, чтобы освободить "
+            "память — переключите вариант на CPU в шапке страницы и "
+            f"нажмите LOAD. Исходная ошибка: {', '.join(errors)}"
+        )
+
+    if full_text and full_text.strip() != accumulated.strip():
+        # The clean file-based text differs from what was already streamed
+        # live from stdout (formatting cleanup, or stdout capture missed
+        # something) — replay it with a real, but time-bounded, typewriter
+        # effect. Step size scales with length so long documents don't take
+        # forever: capped at ~200 steps / ~2.4s regardless of text length.
+        total = len(full_text)
+        steps = min(total, 200)
+        step_size = max(1, total // steps)
+        pos = 0
+        while pos < total:
+            pos = min(pos + step_size, total)
+            yield {"text": full_text[:pos], "done": pos == total}
+            time.sleep(0.012)
+    elif full_text:
+        # Identical to what's already on screen — no point re-flashing it.
+        yield {"text": full_text, "done": True}
     elif accumulated:
         yield {"text": accumulated, "done": True}
     else:
@@ -525,7 +534,7 @@ def explode_pdf(pdf_file: FileData) -> dict:
     Convert a PDF into per-page image paths (CPU only).
     The frontend then calls run_ocr once per page.
     """
-    pages = pdf_to_images(pdf_file["path"], dpi=200)
+    pages = pdf_to_images(pdf_file["path"], dpi=300)
     return {"pages": [{"path": p, "orig_name": os.path.basename(p)} for p in pages]}
 
 
