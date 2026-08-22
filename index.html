@@ -239,7 +239,7 @@
   <header>
     <div class="logo-area">
       <div class="logo-icon">📄</div>
-      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.3</span></span>
+      <span class="logo-text">Unlimited<span>-OCR</span> <span id="app-version" style="font-size:10px; color:var(--text-muted); margin-left:8px;">v1.3.4</span></span>
     </div>
     <div class="header-sep"></div>
 
@@ -474,6 +474,27 @@ async function _refreshModelStatus() {
   }
 }
 
+// Real function declaration (not `window.setDevice = (d) => {...}`) —
+// function declarations are hoisted within the module's top-level scope,
+// so this is safely callable from boot() regardless of textual order, but
+// it's placed here, before boot(), for readability too. The previous
+// version was a plain assignment expression with zero hoisting, textually
+// positioned AFTER boot()'s definition+call: boot() called bare
+// `setDevice('cpu')` synchronously (before any `await`), which ran before
+// that assignment had executed — throwing "ReferenceError: setDevice is
+// not defined", silently aborting the rest of boot() including the
+// device-toggle restore itself. That's why the toggle stayed on GPU after
+// a CPU restart even though the ?device=cpu marker was present in the URL.
+function setDevice(d) {
+  currentDevice = d;
+  document.getElementById('btn-device-gpu').classList.toggle('active', d === 'gpu');
+  document.getElementById('btn-device-cpu').classList.toggle('active', d === 'cpu');
+  // Precision only matters for GPU — CPU only ever runs float32.
+  document.getElementById('precision-wrap').style.display = d === 'gpu' ? 'flex' : 'none';
+  _updateLoadButtonState();
+}
+window.setDevice = setDevice; // exposed for the onclick="setDevice(...)" buttons
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
   _updateLoadButtonState(); // shows "CONNECTING…" immediately, before anything async
@@ -556,15 +577,6 @@ function _updateLoadButtonState() {
   btn.textContent = 'LOAD';
 }
 window._updateLoadButtonState = _updateLoadButtonState;
-
-window.setDevice = (d) => {
-  currentDevice = d;
-  document.getElementById('btn-device-gpu').classList.toggle('active', d === 'gpu');
-  document.getElementById('btn-device-cpu').classList.toggle('active', d === 'cpu');
-  // Precision only matters for GPU — CPU only ever runs float32.
-  document.getElementById('precision-wrap').style.display = d === 'gpu' ? 'flex' : 'none';
-  _updateLoadButtonState();
-};
 
 // run_ocr() prefixes its message with "VRAM_OOM:" when it had to unload the
 // model from the GPU after a CUDA OOM mid-inference (see app.py). This is a
